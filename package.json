@@ -1,9 +1,17 @@
 {
   "name": "pi-fast-subagent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "In-process subagent delegation for pi with single, parallel, and chain modes",
   "type": "module",
   "keywords": ["pi-package", "pi", "subagent", "agents", "extension"],
+  "homepage": "https://github.com/tuansondinh/pi-fast-subagent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tuansondinh/pi-fast-subagent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tuansondinh/pi-fast-subagent/issues"
+  },
   "files": [
     "index.ts",
     "agents.ts",
@@ -19,5 +27,6 @@
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
-  }
+  },
+  "license": "MIT"
 }
