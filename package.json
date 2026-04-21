@@ -1,0 +1,23 @@
+{
+  "name": "pi-fast-subagent",
+  "version": "0.1.0",
+  "description": "In-process subagent delegation for pi with single, parallel, and chain modes",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "subagent", "agents", "extension"],
+  "files": [
+    "index.ts",
+    "agents.ts",
+    "agents/*.md",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
