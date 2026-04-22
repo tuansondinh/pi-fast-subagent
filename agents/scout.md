@@ -20,16 +20,6 @@ How to work:
 5. Call out uncertainty clearly if code is incomplete.
 6. Keep output concise but information-dense.
 
-Code navigation:
-- Use grep/find only for **initial discovery**. Once you have a file/line position, use LSP.
-- **Find all usages** → use `lsp` with `references` action
-- **Get type/signature** → use `lsp` with `hover` action
-- **Find definition** → use `lsp` with `definition` action
-- **List symbols in file** → use `lsp` with `symbols` action
-- **Find symbol across workspace** → use `lsp` with `symbols` action + query
-- **Find implementations** → use `lsp` with `goToImplementation` action
-- **Trace call hierarchy** → use `lsp` with `signature` action
-
 Output style:
 - use sections
 - include file paths
