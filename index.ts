@@ -457,6 +457,72 @@ const SubagentParams = Type.Object({
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // ─── /agent slash command ─────────────────────────────────────────────────
+  pi.registerCommand("agent", {
+    description: "List available subagents. Usage: /agent [name] — show details for a specific agent.",
+    getArgumentCompletions(prefix: string) {
+      const agents = discoverAgents(process.cwd());
+      return agents
+        .filter((a) => a.name.startsWith(prefix))
+        .map((a) => ({ value: a.name, label: a.name, description: a.description }));
+    },
+    async handler(args: string, ctx) {
+      const agents = discoverAgents(ctx.cwd);
+      const name = args.trim();
+
+      if (name) {
+        const agent = agents.find((a) => a.name === name);
+        if (!agent) {
+          const list = agents.map((a) => a.name).join(", ") || "none";
+          ctx.ui.notify(`Unknown agent "${name}". Available: ${list}`, "warning");
+          return;
+        }
+        const lines = [
+          `## ${agent.name} [${agent.source}]`,
+          `File: ${agent.filePath}`,
+          `Description: ${agent.description}`,
+          agent.model ? `Model: ${agent.model}` : "",
+          agent.tools ? `Tools: ${agent.tools.join(", ")}` : "",
+          agent.systemPrompt ? `\nSystem prompt:\n${agent.systemPrompt}` : "",
+        ].filter(Boolean).join("\n");
+        ctx.ui.notify(lines, "info");
+        return;
+      }
+
+      if (agents.length === 0) {
+        ctx.ui.notify(
+          "No agents found.\n" +
+          "Add .md files to:\n" +
+          "  ~/.pi/agent/agents/   (user-level)\n" +
+          "  .pi/agents/           (project-level)\n" +
+          "\nFrontmatter required: name, description. Optional: model, tools.",
+          "info"
+        );
+        return;
+      }
+
+      const userAgents = agents.filter((a) => a.source === "user");
+      const projectAgents = agents.filter((a) => a.source === "project");
+
+      const lines: string[] = [`Agents (${agents.length}):`];
+      if (projectAgents.length) {
+        lines.push("\nProject (.pi/agents/):");
+        for (const a of projectAgents) {
+          lines.push(`  ${a.name}${a.model ? ` [${a.model}]` : ""} — ${a.description}`);
+        }
+      }
+      if (userAgents.length) {
+        lines.push("\nUser (~/.pi/agent/agents/):");
+        for (const a of userAgents) {
+          lines.push(`  ${a.name}${a.model ? ` [${a.model}]` : ""} — ${a.description}`);
+        }
+      }
+      lines.push("");
+      lines.push("Tip: /agent <name> for details · Add .md files to .pi/agents/ to create new agents");
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
   pi.registerTool({
     name: "subagent",
     label: "Subagent",

@@ -59,6 +59,24 @@ model: anthropic/claude-haiku-4-5
 You are code exploration specialist. Read relevant files, trace data flow, summarize findings clearly.
 ```
 
+## Slash Commands
+
+### `/agent`
+
+List all available agents:
+
+```
+/agent
+```
+
+Show details for a specific agent (description, file path, model, tools, system prompt):
+
+```
+/agent scout
+```
+
+Tab-completion is supported for agent names.
+
 ## Usage
 
 ### List agents
