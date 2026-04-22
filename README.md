@@ -8,8 +8,7 @@ Runs subagents with `createAgentSession()` in same process instead of spawning `
 
 - Single mode: `{ agent, task }`
 - Parallel mode: `{ tasks: [...] }`
-- Chain mode: `{ chain: [...] }`
-- Per-call or per-step model override
+- Per-call model override
 - User + project agent discovery
 - Project agents override user agents
 - Max nesting depth guard
@@ -105,17 +104,6 @@ subagent({
     { agent: "scout", task: "Map navigation" }
   ],
   concurrency: 2
-})
-```
-
-### Chain
-
-```js
-subagent({
-  chain: [
-    { agent: "scout", task: "Explore app structure" },
-    { agent: "scout", task: "Based on this: {previous}\n\nExtract only auth flow." }
-  ]
 })
 ```
 
