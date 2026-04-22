@@ -34,5 +34,10 @@
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
   },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.68.0",
+    "@mariozechner/pi-tui": "^0.68.0",
+    "@sinclair/typebox": "^0.34.41"
+  },
   "license": "MIT"
 }
