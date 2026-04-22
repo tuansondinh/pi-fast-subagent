@@ -10,7 +10,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { truncateToWidth } from "@mariozechner/pi-tui";
 import {
   AuthStorage,
   createAgentSession,
@@ -368,22 +368,35 @@ export default function (pi: ExtensionAPI) {
         model?: string;
       };
 
-      let status = "";
+      const statusLines: string[] = [];
       if (details.running) {
         const statusParts: string[] = ["running"];
         if (details.usage?.turns) statusParts.push(`${details.usage.turns} turn${details.usage.turns > 1 ? "s" : ""}`);
         if (details.elapsedMs !== undefined) statusParts.push(formatDuration(details.elapsedMs));
         if (details.model) statusParts.push(details.model);
-        status = `\n${statusParts.join(" · ")}`;
+        statusLines.push(statusParts.join(" · "));
       } else if (details.usage) {
         const usageStr = formatUsage(details.usage, details.model);
-        if (usageStr) status = `\n${usageStr}`;
+        if (usageStr) statusLines.push(usageStr);
       }
 
-      if (isPartial) {
-        return new Text(theme.fg("dim", (text || "Running...") + status), 0, 0);
-      }
-      return new Text(text + status, 0, 0);
+      // Apply dim per-line rather than across the whole block to avoid ANSI codes spanning
+      // newlines, which confuses wrapTextWithAnsi ANSI state tracking.
+      const textLines = (text || (isPartial ? "Running..." : "")).split("\n");
+      const styledLines = isPartial
+        ? [...textLines.map((l) => theme.fg("dim", l)), ...statusLines]
+        : [...textLines, ...statusLines];
+
+      // Use a custom component with truncateToWidth per line instead of Text + wrapTextWithAnsi.
+      // visibleWidth (used by wrapTextWithAnsi) undercounts wide chars (emoji/CJK), causing the
+      // TUI to crash with "Rendered line exceeds terminal width". truncateToWidth uses
+      // graphemeWidth internally and correctly measures wide chars.
+      return {
+        invalidate() {},
+        render(width: number): string[] {
+          return styledLines.map((line) => truncateToWidth(line, width, "...", true));
+        },
+      };
     },
 
     async execute(_id, params, signal, onUpdate, ctx) {
