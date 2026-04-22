@@ -420,13 +420,21 @@ export default function (pi: ExtensionAPI) {
           }
 
           const out: string[] = [];
-          if (cache.skipped && cache.skipped > 0) {
-            const hint = keyHint("app.tools.expand", `expand · ${cache.skipped} earlier lines hidden`);
-            out.push("", truncateToWidth(hint, width, "..."));
-          }
           out.push(...(cache.lines ?? []));
-          // Status line (usage / running)
-          for (const s of statusLines) out.push(truncateToWidth(s, width, "..."));
+
+          // Append expand hint inline with status line
+          const expandHint = (cache.skipped && cache.skipped > 0)
+            ? keyHint("app.tools.expand", `expand · ${cache.skipped} lines hidden`)
+            : "";
+
+          if (statusLines.length > 0) {
+            const first = statusLines[0] + (expandHint ? "  " + expandHint : "");
+            out.push(truncateToWidth(first, width, "..."));
+            for (let i = 1; i < statusLines.length; i++) out.push(truncateToWidth(statusLines[i], width, "..."));
+          } else if (expandHint) {
+            out.push(truncateToWidth(expandHint, width, "..."));
+          }
+
           return out;
         },
       };
