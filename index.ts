@@ -405,8 +405,8 @@ export default function (pi: ExtensionAPI) {
           cache.skipped = undefined;
         },
         render(width: number): string[] {
-          if (expanded || isPartial) {
-            // Full output when expanded or still streaming
+          if (expanded) {
+            // Full output when expanded
             return styledLines.map((line) => truncateToWidth(line, width, "...", true));
           }
 
