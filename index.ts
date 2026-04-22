@@ -11,6 +11,7 @@
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth } from "@mariozechner/pi-tui";
+import { truncateToVisualLines, keyHint } from "@mariozechner/pi-coding-agent";
 import {
   AuthStorage,
   createAgentSession,
@@ -359,7 +360,7 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     parameters: SubagentParams,
 
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { isPartial, expanded }, theme) {
       const text = result.content?.[0]?.type === "text" ? result.content[0].text : "";
       const details = (result.details ?? {}) as {
         usage?: RunResult["usage"];
@@ -380,26 +381,58 @@ export default function (pi: ExtensionAPI) {
         if (usageStr) statusLines.push(usageStr);
       }
 
+      const PREVIEW_LINES = 8;
+
       // Apply dim per-line rather than across the whole block to avoid ANSI codes spanning
       // newlines, which confuses wrapTextWithAnsi ANSI state tracking.
-      const textLines = (text || (isPartial ? "Running..." : "")).split("\n");
+      const rawText = text || (isPartial ? "Running..." : "");
+      const textLines = rawText.split("\n");
       const styledLines = isPartial
         ? [...textLines.map((l) => theme.fg("dim", l)), ...statusLines]
         : [...textLines, ...statusLines];
+
+      // Cache state for collapsed mode (invalidated on width change).
+      const cache: { width?: number; lines?: string[]; skipped?: number } = {};
 
       // Use a custom component with truncateToWidth per line instead of Text + wrapTextWithAnsi.
       // visibleWidth (used by wrapTextWithAnsi) undercounts wide chars (emoji/CJK), causing the
       // TUI to crash with "Rendered line exceeds terminal width". truncateToWidth uses
       // graphemeWidth internally and correctly measures wide chars.
       return {
-        invalidate() {},
+        invalidate() {
+          cache.width = undefined;
+          cache.lines = undefined;
+          cache.skipped = undefined;
+        },
         render(width: number): string[] {
-          return styledLines.map((line) => truncateToWidth(line, width, "...", true));
+          if (expanded || isPartial) {
+            // Full output when expanded or still streaming
+            return styledLines.map((line) => truncateToWidth(line, width, "...", true));
+          }
+
+          // Collapsed: show last PREVIEW_LINES visual lines
+          if (cache.width !== width) {
+            const bodyText = textLines.join("\n");
+            const preview = truncateToVisualLines(bodyText, PREVIEW_LINES, width);
+            cache.lines = preview.visualLines.map((l) => truncateToWidth(l, width, "..."));
+            cache.skipped = preview.skippedCount;
+            cache.width = width;
+          }
+
+          const out: string[] = [];
+          if (cache.skipped && cache.skipped > 0) {
+            const hint = keyHint("app.tools.expand", `expand · ${cache.skipped} earlier lines hidden`);
+            out.push("", truncateToWidth(hint, width, "..."));
+          }
+          out.push(...(cache.lines ?? []));
+          // Status line (usage / running)
+          for (const s of statusLines) out.push(truncateToWidth(s, width, "..."));
+          return out;
         },
       };
     },
 
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx): Promise<any> {
       const cwd = params.cwd ?? ctx.cwd;
       const agents = discoverAgents(cwd);
 
