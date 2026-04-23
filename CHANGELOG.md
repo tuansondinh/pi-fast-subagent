@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
 - `cancel` action: abort a running background job
 - Improve keywords for npm discoverability
 - Include `background-job-manager.ts` and `background-types.ts` in published package
-- Remove chain mode
+- Remove chain mode (LLM/agent can chain calls natively)
 
 ## [0.3.0] - 2026-04-22
 
