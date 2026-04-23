@@ -61,6 +61,60 @@ model: anthropic/claude-haiku-4-5
 You are code exploration specialist. Read relevant files, trace data flow, summarize findings clearly.
 ```
 
+## Background Agents
+
+Every foreground subagent can be moved to background at any time. Background jobs run concurrently while you continue chatting. When a job finishes, pi automatically posts the result as a follow-up message.
+
+### Status bar
+
+While a foreground subagent is running, the pi status bar shows:
+```
+{agent-name} running · Ctrl+Shift+B to move to background
+```
+
+While background jobs are running:
+```
+⧗ N bg agents
+```
+
+### Moving to background
+
+**Keyboard shortcut (while subagent is running):**
+```
+Ctrl+Shift+B
+```
+
+**Slash command:**
+```
+/fast-subagent:bg fg_ab12cd34
+```
+
+**Via tool call:**
+```js
+subagent({ action: "detach", jobId: "fg_ab12cd34" })
+```
+
+### Auto-completion announcement
+
+When a background job finishes, pi injects a follow-up message automatically:
+```
+Background subagent ✓: sa_ab12cd34 (scout, 4.2s)
+> Explore src and summarize architecture
+
+<result output>
+```
+
+Failed jobs are announced the same way with ✗ and the error message.
+
+### Fire-and-forget dispatch
+
+```js
+subagent({ agent: "scout", task: "Explore src", background: true })
+// → { jobId: "sa_ab12cd34", status: "running" }
+```
+
+Job starts immediately and returns — does not block the LLM turn.
+
 ## Slash Commands
 
 ### `/fast-subagent:agent`
@@ -81,13 +135,13 @@ Tab-completion is supported for agent names.
 
 ### `/fast-subagent:bg`
 
-Detach running foreground subagent to background:
+Detach a running foreground subagent to background. Each foreground job has a `fg_` prefixed ID shown in the status bar.
 
 ```
 /fast-subagent:bg fg_ab12cd34
 ```
 
-Omit job id to list active foreground jobs:
+Omit ID to list all active foreground jobs:
 
 ```
 /fast-subagent:bg
@@ -95,13 +149,13 @@ Omit job id to list active foreground jobs:
 
 ### `/fast-subagent:bg-status`
 
-Show active background subagents in selector UI. Arrow keys move selection. Enter shows full details for selected job.
+Open selector UI showing all active background jobs. Arrow keys to navigate, Enter to view full details.
 
 ```
 /fast-subagent:bg-status
 ```
 
-Show details for specific background job:
+Skip the selector — show details for a specific job directly:
 
 ```
 /fast-subagent:bg-status sa_ab12cd34
@@ -109,17 +163,23 @@ Show details for specific background job:
 
 ### `/fast-subagent:bg-cancel`
 
-Cancel running background subagent. Omit job id to open selector UI, then choose job with arrow keys.
+Open selector UI to choose a running job to cancel:
 
 ```
 /fast-subagent:bg-cancel
 ```
 
-Cancel specific background job directly:
+Cancel a specific job directly:
 
 ```
 /fast-subagent:bg-cancel sa_ab12cd34
 ```
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+Shift+B` | Move active foreground subagent to background |
 
 ## Usage
 
