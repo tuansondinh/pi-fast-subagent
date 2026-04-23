@@ -1,14 +1,27 @@
 {
   "name": "pi-fast-subagent",
-  "version": "0.3.0",
-  "description": "In-process subagent delegation for pi with single, parallel, and chain modes",
+  "version": "0.4.0",
+  "description": "In-process subagent delegation for pi with single, parallel, and background modes",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi",
+    "pi-extension",
     "subagent",
     "agents",
-    "extension"
+    "extension",
+    "delegation",
+    "parallel",
+    "concurrent",
+    "in-process",
+    "fast",
+    "coding-agent",
+    "ai-agent",
+    "llm",
+    "task-runner",
+    "scout",
+    "workflow",
+    "automation"
   ],
   "homepage": "https://github.com/tuansondinh/pi-fast-subagent#readme",
   "repository": {
@@ -21,6 +34,8 @@
   "files": [
     "index.ts",
     "agents.ts",
+    "background-job-manager.ts",
+    "background-types.ts",
     "agents/*.md",
     "README.md"
   ],

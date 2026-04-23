@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-04-23
+
+### Features
+- Background job support: `subagent({ agent, task, background: true })` returns job ID immediately
+- `status` action: list all background jobs
+- `poll` action: check result/progress of a specific job by `jobId`
+- `cancel` action: abort a running background job
+- Improve keywords for npm discoverability
+- Include `background-job-manager.ts` and `background-types.ts` in published package
+- Remove chain mode
+
 ## [0.3.0] - 2026-04-22
 
 ### Features

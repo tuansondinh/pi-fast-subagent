@@ -8,6 +8,7 @@ Runs subagents with `createAgentSession()` in same process instead of spawning `
 
 - Single mode: `{ agent, task }`
 - Parallel mode: `{ tasks: [...] }`
+- Background mode: `{ agent, task, background: true }` — fire-and-forget with poll/cancel
 - Per-call model override
 - User + project agent discovery
 - Project agents override user agents

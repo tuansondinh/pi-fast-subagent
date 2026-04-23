@@ -15,6 +15,8 @@ import type {
   ExtensionContext,
   ToolRenderResultOptions,
 } from "@mariozechner/pi-coding-agent";
+import { BackgroundJobManager } from "./background-job-manager.js";
+import type { BackgroundHandleLike, BackgroundJobResult } from "./background-types.js";
 import { Theme } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { truncateToVisualLines, keyHint } from "@mariozechner/pi-coding-agent";
@@ -94,11 +96,17 @@ function summarizeToolArgs(toolName: unknown, toolInput: unknown): string {
 
 let _authStorage: ReturnType<typeof AuthStorage.create> | null = null;
 let _modelRegistry: ReturnType<typeof ModelRegistry.create> | null = null;
+let _bgManager: BackgroundJobManager | null = null;
 
 function getAuth() {
   if (!_authStorage) _authStorage = AuthStorage.create();
   if (!_modelRegistry) _modelRegistry = ModelRegistry.create(_authStorage);
   return { authStorage: _authStorage, modelRegistry: _modelRegistry };
+}
+
+function getBgManager(): BackgroundJobManager {
+  if (!_bgManager) _bgManager = new BackgroundJobManager();
+  return _bgManager;
 }
 
 // ─── In-process runner ───────────────────────────────────────────────────────
@@ -231,7 +239,10 @@ async function runAgent(
   const toolCalls: ToolCallEntry[] = [];
   const toolStartTimes = new Map<string, number>();
 
+  let done = false;
+
   function emitUpdate(): void {
+    if (done) return;
     onUpdate?.({
       content: [{ type: "text", text: currentDelta || lastOutput || "" }],
       details: {
@@ -354,6 +365,7 @@ async function runAgent(
     exitCode = 1;
     error = signal?.aborted ? "Aborted" : e instanceof Error ? e.message : String(e);
   } finally {
+    done = true;
     clearInterval(heartbeat);
     unsubscribe();
     session.dispose();
@@ -436,14 +448,21 @@ const SubagentParams = Type.Object({
     Type.Number({ description: "Max parallel concurrency (default: 4)", default: 4 }),
   ),
 
+  // Background
+  background: Type.Optional(Type.Boolean({ description: "Run in background, returns job ID immediately" })),
+  jobId: Type.Optional(Type.String({ description: "Job ID for poll/cancel" })),
+
   // Management
   action: Type.Optional(
     Type.Union(
       [
         Type.Literal("list"),
         Type.Literal("get"),
+        Type.Literal("status"),
+        Type.Literal("poll"),
+        Type.Literal("cancel"),
       ],
-      { description: "'list' to discover agents, 'get' to inspect one agent" },
+      { description: "'list'/'get' for agents, 'status' for bg jobs, 'poll'/'cancel' for a specific job" },
     ),
   ),
   agentScope: Type.Optional(
@@ -721,7 +740,7 @@ export default function (pi: ExtensionAPI) {
       };
 
       // ── Management: list ──────────────────────────────────────────────────────
-      if (params.action === "list" || (!params.agent && !params.tasks)) {
+      if (params.action === "list" || (!params.action && !params.agent && !params.tasks)) {
         if (agents.length === 0) {
           return {
             content: [{
@@ -750,10 +769,55 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: info }] };
       }
 
+      // ── Background status ───────────────────────────────────────────────────
+      if (params.action === "status") {
+        const jobs = getBgManager().getAllJobs();
+        if (jobs.length === 0) return { content: [{ type: "text", text: "No background jobs." }] };
+        const lines = jobs.map((j) => {
+          const dur = j.completedAt ? formatDuration(j.completedAt - j.startedAt) : formatDuration(Date.now() - j.startedAt);
+          return `${j.id} [${j.status}] ${j.agentName} · ${dur} · ${j.task.length > 50 ? j.task.slice(0, 47) + "..." : j.task}`;
+        });
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      // ── Background poll ────────────────────────────────────────────────────────
+      if (params.action === "poll") {
+        if (!params.jobId) return { content: [{ type: "text", text: "Provide jobId to poll." }] };
+        const job = getBgManager().getJob(params.jobId);
+        if (!job) return { content: [{ type: "text", text: `Job ${params.jobId} not found (completed and evicted, or invalid).` }] };
+        const dur = job.completedAt ? formatDuration(job.completedAt - job.startedAt) : formatDuration(Date.now() - job.startedAt);
+        const parts = [`${job.id} [${job.status}] ${job.agentName} · ${dur}`, `Task: ${job.task}`];
+        if (job.status === "completed") parts.push(`\nResult:\n${job.resultSummary ?? "(no output)"}`);
+        if (job.status === "failed") parts.push(`\nError: ${job.error ?? "(unknown)"}`);
+        if (job.status === "running") parts.push("Still running — poll again later.");
+        return { content: [{ type: "text", text: parts.join("\n") }] };
+      }
+
+      // ── Background cancel ──────────────────────────────────────────────────────
+      if (params.action === "cancel") {
+        if (!params.jobId) return { content: [{ type: "text", text: "Provide jobId to cancel." }] };
+        const result = getBgManager().cancel(params.jobId);
+        const msg = result === "cancelled" ? `Job ${params.jobId} cancelled.`
+          : result === "already_done" ? `Job ${params.jobId} already completed.`
+          : `Job ${params.jobId} not found.`;
+        return { content: [{ type: "text", text: msg }] };
+      }
+
       // ── Single mode ───────────────────────────────────────────────────────────
       if (params.agent && params.task) {
         const { agent, error } = findAgent(params.agent);
         if (error || !agent) return { content: [{ type: "text", text: error ?? "Not found" }] };
+
+        // Background dispatch — fire and forget
+        if (params.background) {
+          const bgAbort = new AbortController();
+          const handle: BackgroundHandleLike = { abort: () => bgAbort.abort() };
+          const resultPromise: Promise<BackgroundJobResult> = runAgent(
+            agent, params.task, cwd, params.model, bgAbort.signal, undefined
+          ).then((r) => ({ summary: r.output, exitCode: r.exitCode, error: r.error, model: r.model }));
+          const jobId = getBgManager().adoptHandle(agent.name, params.task, cwd, handle, resultPromise);
+          return { content: [{ type: "text", text: `Background job started: ${jobId}\nCheck progress: subagent({ action: "poll", jobId: "${jobId}" })` }] };
+        }
 
         const result = await runAgent(
           agent,
