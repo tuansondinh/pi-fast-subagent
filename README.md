@@ -126,7 +126,14 @@ Cancel specific background job directly:
 ### List agents
 
 ```js
+// List all agents
 subagent({ action: "list" })
+
+// Get details for a specific agent
+subagent({ action: "get", agent: "scout" })
+
+// Scope filter: "user" | "project" | "both" (default)
+subagent({ action: "list", agentScope: "project" })
 ```
 
 ### Single
@@ -165,7 +172,12 @@ subagent({
     { agent: "scout", task: "Map auth flow" },
     { agent: "scout", task: "Map navigation" }
   ],
-  concurrency: 2
+  concurrency: 2  // default: 4
+})
+
+// Repeat one task N times in parallel
+subagent({
+  tasks: [{ agent: "scout", task: "Explore src", count: 3 }]
 })
 ```
 
@@ -189,12 +201,18 @@ subagent({ action: "status" })
 subagent({ action: "detach", jobId: "fg_ab12cd34" })
 ```
 
+### Working directory override
+
+```js
+subagent({ agent: "scout", task: "Explore", cwd: "/path/to/project" })
+```
+
 ## Roadmap
 
 Goal: keep this extension **small and focused** — aligned with pi's philosophy of minimal, composable tooling. No feature creep. Every addition must earn its place.
 
 - **UI/UX polish** — improve visibility of running subagents: clearer status lines, better progress feedback, agent name + task always visible during execution
-- **Background agents** — ala claude code
+- ~~**Background subagents**~~ ✔ shipped in v0.4.0 — fire-and-forget with `background: true`, poll/cancel/detach support
 
 ## Notes
 
