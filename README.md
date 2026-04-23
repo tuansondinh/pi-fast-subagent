@@ -131,7 +131,7 @@ subagent({
 Goal: keep this extension **small and focused** — aligned with pi's philosophy of minimal, composable tooling. No feature creep. Every addition must earn its place.
 
 - **UI/UX polish** — improve visibility of running subagents: clearer status lines, better progress feedback, agent name + task always visible during execution
-- ~~**Background subagents**~~ ✔ shipped in v0.4.0 — fire-and-forget dispatch with `background: true`, poll/cancel via `action: "poll" | "cancel"`
+- **Background agents** — ala claude code
 
 ## Notes
 
