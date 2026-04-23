@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-04-23
+
+### Other
+- Improve README: background agents lifecycle, all slash commands, keyboard shortcuts, tool reference section
+
 ## [0.5.0] - 2026-04-23
 
 ### Features
