@@ -8,6 +8,7 @@
  * Agent .md files are compatible with pi-subagents frontmatter format.
  */
 
+import { randomUUID } from "node:crypto";
 import type {
   AgentToolResult,
   AgentToolUpdateCallback,
@@ -16,9 +17,9 @@ import type {
   ToolRenderResultOptions,
 } from "@mariozechner/pi-coding-agent";
 import { BackgroundJobManager } from "./background-job-manager.js";
-import type { BackgroundHandleLike, BackgroundJobResult } from "./background-types.js";
+import type { BackgroundHandleLike, BackgroundJobResult, BackgroundSubagentJob } from "./background-types.js";
 import { Theme } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { Key, truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { truncateToVisualLines, keyHint } from "@mariozechner/pi-coding-agent";
 import {
   AuthStorage,
@@ -97,6 +98,8 @@ function summarizeToolArgs(toolName: unknown, toolInput: unknown): string {
 let _authStorage: ReturnType<typeof AuthStorage.create> | null = null;
 let _modelRegistry: ReturnType<typeof ModelRegistry.create> | null = null;
 let _bgManager: BackgroundJobManager | null = null;
+let _onBgJobComplete: ((job: BackgroundSubagentJob) => void) | null = null;
+let _setBgStatus: ((text: string | undefined) => void) | null = null;
 
 function getAuth() {
   if (!_authStorage) _authStorage = AuthStorage.create();
@@ -105,9 +108,25 @@ function getAuth() {
 }
 
 function getBgManager(): BackgroundJobManager {
-  if (!_bgManager) _bgManager = new BackgroundJobManager();
+  if (!_bgManager) _bgManager = new BackgroundJobManager({
+    onJobComplete: (job) => _onBgJobComplete?.(job),
+  });
   return _bgManager;
 }
+
+function refreshBgStatus(): void {
+  const running = getBgManager().getRunningJobs();
+  _setBgStatus?.(running.length > 0 ? `⧗ ${running.length} bg agent${running.length > 1 ? "s" : ""}` : undefined);
+}
+
+// ─── Foreground detach registry ───────────────────────────────────────────────
+
+interface ForegroundDetachEntry {
+  agentName: string;
+  task: string;
+  detach: () => string; // returns bg job id
+}
+const _fgJobs = new Map<string, ForegroundDetachEntry>();
 
 // ─── In-process runner ───────────────────────────────────────────────────────
 
@@ -150,6 +169,7 @@ interface SubagentDetails {
   running: boolean;
   elapsedMs?: number;
   model?: string;
+  backgroundJobId?: string;
   toolCalls: ToolCallEntry[];
 }
 
@@ -160,6 +180,26 @@ function formatDuration(ms: number): string {
   const m = Math.floor(s / 60);
   const rem = s % 60;
   return m > 0 ? `${m}m ${rem}s` : `${rem}s`;
+}
+
+function summarizeTask(task: string, max = 60): string {
+  return task.length > max ? task.slice(0, max - 3) + "..." : task;
+}
+
+function formatBgJobSummary(job: BackgroundSubagentJob, now = Date.now()): string {
+  const dur = job.completedAt ? formatDuration(job.completedAt - job.startedAt) : formatDuration(now - job.startedAt);
+  return `${job.id} [${job.status}] ${job.agentName} · ${dur} · ${summarizeTask(job.task)}`;
+}
+
+function formatBgJobDetails(job: BackgroundSubagentJob, now = Date.now()): string {
+  const dur = job.completedAt ? formatDuration(job.completedAt - job.startedAt) : formatDuration(now - job.startedAt);
+  const lines = [`${job.id} [${job.status}] ${job.agentName} · ${dur}`, `Task: ${job.task}`];
+  if (job.model) lines.push(`Model: ${job.model}`);
+  if (job.status === "completed") lines.push(`\nResult:\n${job.resultSummary ?? "(no output)"}`);
+  if (job.status === "failed") lines.push(`\nError: ${job.error ?? "(unknown)"}`);
+  if (job.status === "cancelled") lines.push("\nCancelled.");
+  if (job.status === "running") lines.push("\nStill running.");
+  return lines.join("\n");
 }
 
 // Module-level depth counter — avoids process.env race conditions in parallel mode
@@ -461,8 +501,9 @@ const SubagentParams = Type.Object({
         Type.Literal("status"),
         Type.Literal("poll"),
         Type.Literal("cancel"),
+        Type.Literal("detach"),
       ],
-      { description: "'list'/'get' for agents, 'status' for bg jobs, 'poll'/'cancel' for a specific job" },
+      { description: "'list'/'get' for agents, 'status' for bg jobs, 'poll'/'cancel' for a specific job, 'detach' to move a foreground job to background" },
     ),
   ),
   agentScope: Type.Optional(
@@ -476,9 +517,65 @@ const SubagentParams = Type.Object({
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // ─── Status keys ────────────────────────────────────────────────────────────────────
+  const BG_STATUS_KEY = "fast-subagent-bg";
+  const FG_STATUS_KEY = "fast-subagent-fg";
+
+  // ─── Background job lifecycle ─────────────────────────────────────────────────────
+  _onBgJobComplete = (job) => {
+    refreshBgStatus();
+    const elapsed = job.completedAt ? ((job.completedAt - job.startedAt) / 1000).toFixed(1) : "?";
+    const statusEmoji = job.status === "completed" ? "✓" : "✗";
+    const taskPreview = job.task.length > 80 ? `${job.task.slice(0, 80)}…` : job.task;
+    const output = job.status === "completed"
+      ? (job.resultSummary ?? "(no output)")
+      : `Error: ${job.error ?? "unknown"}`;
+    const modelInfo = job.model ? ` · ${job.model}` : "";
+    pi.sendUserMessage(
+      [
+        `**Background subagent ${statusEmoji}: ${job.id}** (${job.agentName}, ${elapsed}s${modelInfo})`,
+        `> ${taskPreview}`,
+        ``,
+        output,
+      ].join("\n"),
+      { deliverAs: "followUp" },
+    );
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    _setBgStatus = (text) => ctx.ui.setStatus(BG_STATUS_KEY, text);
+  });
+
+  pi.on("session_shutdown", async () => {
+    getBgManager().shutdown();
+    _bgManager = null;
+    _setBgStatus = null;
+  });
+
+  // ─── Ctrl+Shift+B — move foreground subagent to background ─────────────────────────
+  pi.registerShortcut(Key.ctrlShift("b"), {
+    description: "Move foreground subagent to background",
+    handler: async (ctx) => {
+      const entry = [..._fgJobs.values()][0];
+      if (!entry) {
+        ctx.ui.notify("No foreground subagent running.", "info");
+        return;
+      }
+      try {
+        const bgJobId = entry.detach();
+        ctx.ui.notify(
+          `Moved ${entry.agentName} to background as ${bgJobId}. Completion will be announced automatically.`,
+          "info",
+        );
+      } catch (e) {
+        ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
+      }
+    },
+  });
+
   // ─── /agent slash command ─────────────────────────────────────────────────
-  pi.registerCommand("agent", {
-    description: "List available subagents. Usage: /agent [name] — show details for a specific agent.",
+  pi.registerCommand("fast-subagent:agent", {
+    description: "List available subagents. Usage: /fast-subagent:agent [name] — show details for a specific agent.",
     getArgumentCompletions(prefix: string) {
       const agents = discoverAgents(process.cwd());
       return agents
@@ -537,8 +634,129 @@ export default function (pi: ExtensionAPI) {
         }
       }
       lines.push("");
-      lines.push("Tip: /agent <name> for details · Add .md files to .pi/agents/ to create new agents");
+      lines.push("Tip: /fast-subagent:agent <name> for details · Add .md files to .pi/agents/ to create new agents");
       ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  // ─── /bg slash command ────────────────────────────────────────────────────
+  pi.registerCommand("fast-subagent:bg", {
+    description: "Move a running foreground subagent to background. Shortcut: Ctrl+Shift+B. Usage: /fast-subagent:bg [fg-job-id] — omit ID to list active foreground jobs.",
+    getArgumentCompletions(_prefix: string) {
+      return [..._fgJobs.keys()].map((id) => ({ value: id, label: id }));
+    },
+    async handler(args: string, ctx) {
+      const id = args.trim();
+      if (!id) {
+        if (_fgJobs.size === 0) {
+          ctx.ui.notify("No active foreground subagent jobs.", "info");
+          return;
+        }
+        const lines = ["Active foreground jobs (use /fast-subagent:bg <id> to detach):"];
+        for (const [fgId, entry] of _fgJobs) {
+          lines.push(`  ${fgId}  ${entry.agentName}: ${summarizeTask(entry.task)}`);
+        }
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+      const entry = _fgJobs.get(id);
+      if (!entry) {
+        ctx.ui.notify(`Foreground job "${id}" not found (already done or invalid).`, "warning");
+        return;
+      }
+      const bgJobId = entry.detach();
+      ctx.ui.notify(
+        `Moved to background: ${bgJobId}\nTo check status, ask me to poll job ${bgJobId}.`,
+        "info",
+      );
+    },
+  });
+
+  // ─── /bg-status slash command ─────────────────────────────────────────────
+  pi.registerCommand("fast-subagent:bg-status", {
+    description: "Show active background subagents. Usage: /fast-subagent:bg-status [sa-job-id] — omit ID to open selector.",
+    getArgumentCompletions(prefix: string) {
+      return getBgManager().getAllJobs()
+        .filter((job) => job.id.startsWith(prefix))
+        .map((job) => ({ value: job.id, label: formatBgJobSummary(job) }));
+    },
+    async handler(args: string, ctx) {
+      const id = args.trim();
+      if (id) {
+        const job = getBgManager().getJob(id);
+        if (!job) {
+          ctx.ui.notify(`Background job "${id}" not found.`, "warning");
+          return;
+        }
+        ctx.ui.notify(formatBgJobDetails(job), "info");
+        return;
+      }
+
+      const jobs = getBgManager().getRunningJobs().sort((a, b) => b.startedAt - a.startedAt);
+      if (jobs.length === 0) {
+        ctx.ui.notify("No active background subagent jobs.", "info");
+        return;
+      }
+
+      const options = jobs.map((job) => formatBgJobSummary(job));
+      const selected = await ctx.ui.select("Active background subagents", options);
+      if (!selected) return;
+
+      const jobId = selected.split(" ")[0] ?? "";
+      const job = getBgManager().getJob(jobId);
+      if (!job) {
+        ctx.ui.notify(`Background job "${jobId}" not found.`, "warning");
+        return;
+      }
+      ctx.ui.notify(formatBgJobDetails(job), "info");
+    },
+  });
+
+  // ─── /bg-cancel slash command ─────────────────────────────────────────────
+  pi.registerCommand("fast-subagent:bg-cancel", {
+    description: "Cancel running background subagent. Usage: /fast-subagent:bg-cancel [sa-job-id] — omit ID to choose with arrow keys.",
+    getArgumentCompletions(prefix: string) {
+      return getBgManager().getRunningJobs()
+        .filter((job) => job.id.startsWith(prefix))
+        .map((job) => ({ value: job.id, label: formatBgJobSummary(job) }));
+    },
+    async handler(args: string, ctx) {
+      let jobId = args.trim();
+
+      if (!jobId) {
+        const jobs = getBgManager().getRunningJobs().sort((a, b) => b.startedAt - a.startedAt);
+        if (jobs.length === 0) {
+          ctx.ui.notify("No running background subagent jobs to cancel.", "info");
+          return;
+        }
+
+        const options = jobs.map((job) => formatBgJobSummary(job));
+        const selected = await ctx.ui.select("Cancel background subagent", options);
+        if (!selected) return;
+        jobId = selected.split(" ")[0] ?? "";
+      }
+
+      const job = getBgManager().getJob(jobId);
+      if (!job) {
+        ctx.ui.notify(`Background job "${jobId}" not found.`, "warning");
+        return;
+      }
+      if (job.status !== "running") {
+        ctx.ui.notify(`Background job "${jobId}" already ${job.status}.`, "info");
+        return;
+      }
+
+      const confirmed = await ctx.ui.confirm(
+        "Cancel background subagent?",
+        `${formatBgJobSummary(job)}\n\nTask:\n${job.task}`,
+      );
+      if (!confirmed) return;
+
+      const result = getBgManager().cancel(jobId);
+      const msg = result === "cancelled" ? `Background job "${jobId}" cancelled.`
+        : result === "already_done" ? `Background job "${jobId}" already completed.`
+        : `Background job "${jobId}" not found.`;
+      ctx.ui.notify(msg, result === "cancelled" ? "info" : "warning");
     },
   });
 
@@ -633,6 +851,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       function statusLine(): string {
+        if (details.backgroundJobId) return `moved to background · ${details.backgroundJobId}`;
         if (details.running) {
           const parts: string[] = ["running"];
           if (details.usage?.turns) parts.push(`${details.usage.turns} turn${details.usage.turns > 1 ? "s" : ""}`);
@@ -720,6 +939,8 @@ export default function (pi: ExtensionAPI) {
               : "";
           const statusWithHint = [status, expandHint].filter(Boolean).join("  ");
           if (statusWithHint) out.push(truncateToWidth(statusWithHint, width, "..."));
+          if (details.running && !details.backgroundJobId)
+            out.push(truncateToWidth(theme.fg("dim", "Ctrl+Shift+B: move to background"), width, "..."));
 
           return out;
         },
@@ -803,6 +1024,15 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: msg }] };
       }
 
+      // ── Foreground → background detach ────────────────────────────────────────
+      if (params.action === "detach") {
+        if (!params.jobId) return { content: [{ type: "text", text: "Provide jobId (fg_xxxxx) to detach." }] };
+        const fgEntry = _fgJobs.get(params.jobId);
+        if (!fgEntry) return { content: [{ type: "text", text: `Foreground job "${params.jobId}" not found (already completed or invalid).` }] };
+        const bgJobId = fgEntry.detach();
+        return { content: [{ type: "text", text: `Moved to background: ${bgJobId}\nTo check status, ask me to poll job ${bgJobId}.` }] };
+      }
+
       // ── Single mode ───────────────────────────────────────────────────────────
       if (params.agent && params.task) {
         const { agent, error } = findAgent(params.agent);
@@ -816,18 +1046,74 @@ export default function (pi: ExtensionAPI) {
             agent, params.task, cwd, params.model, bgAbort.signal, undefined
           ).then((r) => ({ summary: r.output, exitCode: r.exitCode, error: r.error, model: r.model }));
           const jobId = getBgManager().adoptHandle(agent.name, params.task, cwd, handle, resultPromise);
-          return { content: [{ type: "text", text: `Background job started: ${jobId}\nCheck progress: subagent({ action: "poll", jobId: "${jobId}" })` }] };
+          return { content: [{ type: "text", text: `Background job started: ${jobId}\nTo check status, ask me to poll job ${jobId}.` }] };
         }
 
-        const result = await runAgent(
-          agent,
-          params.task,
-          cwd,
-          params.model,
-          signal,
-          onUpdate,
+        // Foreground run with detach support
+        const fgId = `fg_${randomUUID().slice(0, 8)}`;
+        const agentAbort = new AbortController();
+        const forwardAbort = () => agentAbort.abort();
+        signal?.addEventListener("abort", forwardAbort, { once: true });
+
+        let detachResolveFn: ((bgJobId: string) => void) | null = null;
+        const detachPromise = new Promise<string>((resolve) => { detachResolveFn = resolve; });
+
+        // Wrap onUpdate so detach can stop forwarding updates to the parent
+        // agent's listener (which becomes invalid once execute() returns).
+        let forwardUpdates = true;
+        const wrappedOnUpdate: OnUpdate | undefined = onUpdate
+          ? (partial) => { if (forwardUpdates) onUpdate(partial); }
+          : undefined;
+
+        const agentRunPromise: Promise<RunResult> = runAgent(
+          agent, params.task, cwd, params.model, agentAbort.signal, wrappedOnUpdate,
         );
 
+        // Derived promise for the bg manager (used only if we detach)
+        const bgResultPromise: Promise<BackgroundJobResult> = agentRunPromise
+          .then((r) => ({ summary: r.output, exitCode: r.exitCode, error: r.error, model: r.model }));
+
+        _fgJobs.set(fgId, {
+          agentName: agent.name,
+          task: params.task,
+          detach: () => {
+            forwardUpdates = false;
+            signal?.removeEventListener("abort", forwardAbort);
+            const bgHandle: BackgroundHandleLike = { abort: () => agentAbort.abort() };
+            const bgJobId = getBgManager().adoptHandle(agent.name, params.task, cwd, bgHandle, bgResultPromise);
+            refreshBgStatus();
+            detachResolveFn?.(bgJobId);
+            return bgJobId;
+          },
+        });
+
+        ctx.ui.setStatus(FG_STATUS_KEY, `${agent.name} running · Ctrl+Shift+B to move to background`);
+
+        let runResult: RunResult | null = null;
+        const outcome = await Promise.race([
+          agentRunPromise.then((r) => { runResult = r; return "done" as const; }),
+          detachPromise.then(() => "detached" as const),
+        ]).finally(() => {
+          _fgJobs.delete(fgId);
+          signal?.removeEventListener("abort", forwardAbort);
+          ctx.ui.setStatus(FG_STATUS_KEY, undefined);
+        });
+
+        if (outcome === "detached") {
+          const bgJobId = await detachPromise; // already resolved — instant
+          return {
+            content: [{ type: "text", text: `Moved to background: ${bgJobId}. Completion will be announced automatically.` }],
+            details: {
+              task: params.task,
+              usage: { input: 0, output: 0, cost: 0, turns: 0 },
+              running: false,
+              backgroundJobId: bgJobId,
+              toolCalls: [],
+            } satisfies SubagentDetails,
+          };
+        }
+
+        const result = runResult!;
         return {
           content: [{ type: "text", text: getFinalText(result) }],
           details: {

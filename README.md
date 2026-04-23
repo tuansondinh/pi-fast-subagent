@@ -8,6 +8,8 @@ Runs subagents with `createAgentSession()` in same process instead of spawning `
 
 - Single mode: `{ agent, task }`
 - Parallel mode: `{ tasks: [...] }`
+- Background mode: `{ agent, task, background: true }` — fire-and-forget with poll/cancel
+- Slash commands for background job status + cancellation via selector UI
 - Per-call model override
 - User + project agent discovery
 - Project agents override user agents
@@ -61,21 +63,63 @@ You are code exploration specialist. Read relevant files, trace data flow, summa
 
 ## Slash Commands
 
-### `/agent`
+### `/fast-subagent:agent`
 
 List all available agents:
 
 ```
-/agent
+/fast-subagent:agent
 ```
 
 Show details for a specific agent (description, file path, model, tools, system prompt):
 
 ```
-/agent scout
+/fast-subagent:agent scout
 ```
 
 Tab-completion is supported for agent names.
+
+### `/fast-subagent:bg`
+
+Detach running foreground subagent to background:
+
+```
+/fast-subagent:bg fg_ab12cd34
+```
+
+Omit job id to list active foreground jobs:
+
+```
+/fast-subagent:bg
+```
+
+### `/fast-subagent:bg-status`
+
+Show active background subagents in selector UI. Arrow keys move selection. Enter shows full details for selected job.
+
+```
+/fast-subagent:bg-status
+```
+
+Show details for specific background job:
+
+```
+/fast-subagent:bg-status sa_ab12cd34
+```
+
+### `/fast-subagent:bg-cancel`
+
+Cancel running background subagent. Omit job id to open selector UI, then choose job with arrow keys.
+
+```
+/fast-subagent:bg-cancel
+```
+
+Cancel specific background job directly:
+
+```
+/fast-subagent:bg-cancel sa_ab12cd34
+```
 
 ## Usage
 
@@ -123,6 +167,26 @@ subagent({
   ],
   concurrency: 2
 })
+```
+
+### Background (fire-and-forget)
+
+```js
+// Dispatch — returns job ID immediately
+subagent({ agent: "scout", task: "Explore src", background: true })
+// → { jobId: "sa_ab12cd34", status: "running" }
+
+// Poll — check result / progress
+subagent({ action: "poll", jobId: "sa_ab12cd34" })
+
+// Cancel
+subagent({ action: "cancel", jobId: "sa_ab12cd34" })
+
+// List all background jobs
+subagent({ action: "status" })
+
+// Detach a running foreground job to background
+subagent({ action: "detach", jobId: "fg_ab12cd34" })
 ```
 
 ## Roadmap

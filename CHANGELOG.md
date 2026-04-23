@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-04-23
+
+### Features
+- Namespace all slash commands under `fast-subagent:` prefix (`/fast-subagent:agent`, `/fast-subagent:bg`, `/fast-subagent:bg-status`, `/fast-subagent:bg-cancel`)
+
+### Other
+- Add roadmap to docs
+- Clarify chain mode removal reason
+
 ## [0.4.0] - 2026-04-23
 
 ### Features
