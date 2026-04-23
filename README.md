@@ -106,15 +106,6 @@ Background subagent ✓: sa_ab12cd34 (scout, 4.2s)
 
 Failed jobs are announced the same way with ✗ and the error message.
 
-### Fire-and-forget dispatch
-
-```js
-subagent({ agent: "scout", task: "Explore src", background: true })
-// → { jobId: "sa_ab12cd34", status: "running" }
-```
-
-Job starts immediately and returns — does not block the LLM turn.
-
 ## Slash Commands
 
 ### `/fast-subagent:agent`
@@ -181,9 +172,24 @@ Cancel a specific job directly:
 |---|---|
 | `Ctrl+Shift+B` | Move active foreground subagent to background |
 
-## Usage
+## Roadmap
 
-### List agents
+Goal: keep this extension **small and focused** — aligned with pi's philosophy of minimal, composable tooling. No feature creep. Every addition must earn its place.
+
+- **UI/UX polish** — improve visibility of running subagents: clearer status lines, better progress feedback, agent name + task always visible during execution
+- ~~**Background subagents**~~ ✔ shipped in v0.4.0 — fire-and-forget with `background: true`, poll/cancel/detach support
+
+## Notes
+
+- Async/background isolation not supported in-process
+- Git worktree isolation not supported
+- Nested subagent depth limited to 2 by default
+
+## Tool Reference
+
+> These are `subagent` tool call examples used by the LLM internally. Not typically invoked directly by users.
+
+### List / discover agents
 
 ```js
 // List all agents
@@ -199,29 +205,7 @@ subagent({ action: "list", agentScope: "project" })
 ### Single
 
 ```js
-subagent({
-  agent: "scout",
-  task: "Explore src and summarize architecture"
-})
-```
-
-### General-purpose built-in agent
-
-```js
-subagent({
-  agent: "general",
-  task: "Summarize open TODOs and propose next step"
-})
-```
-
-### Override model
-
-```js
-subagent({
-  agent: "scout",
-  task: "Explore src and summarize architecture",
-  model: "anthropic/claude-haiku-4-5"
-})
+subagent({ agent: "scout", task: "Explore src and summarize architecture" })
 ```
 
 ### Parallel
@@ -235,50 +219,29 @@ subagent({
   concurrency: 2  // default: 4
 })
 
-// Repeat one task N times in parallel
-subagent({
-  tasks: [{ agent: "scout", task: "Explore src", count: 3 }]
-})
+// Repeat one task N times
+subagent({ tasks: [{ agent: "scout", task: "Explore src", count: 3 }] })
 ```
 
-### Background (fire-and-forget)
+### Background
 
 ```js
-// Dispatch — returns job ID immediately
+// Fire-and-forget — returns job ID immediately
 subagent({ agent: "scout", task: "Explore src", background: true })
 // → { jobId: "sa_ab12cd34", status: "running" }
 
-// Poll — check result / progress
-subagent({ action: "poll", jobId: "sa_ab12cd34" })
-
-// Cancel
-subagent({ action: "cancel", jobId: "sa_ab12cd34" })
-
-// List all background jobs
-subagent({ action: "status" })
-
-// Detach a running foreground job to background
-subagent({ action: "detach", jobId: "fg_ab12cd34" })
+subagent({ action: "poll",   jobId: "sa_ab12cd34" })  // check progress
+subagent({ action: "cancel", jobId: "sa_ab12cd34" })  // abort
+subagent({ action: "status" })                        // list all bg jobs
+subagent({ action: "detach", jobId: "fg_ab12cd34" })  // move fg → bg
 ```
 
-### Working directory override
+### Options
 
 ```js
-subagent({ agent: "scout", task: "Explore", cwd: "/path/to/project" })
+subagent({ agent: "scout", task: "...", model: "anthropic/claude-haiku-4-5" })
+subagent({ agent: "scout", task: "...", cwd: "/path/to/project" })
 ```
-
-## Roadmap
-
-Goal: keep this extension **small and focused** — aligned with pi's philosophy of minimal, composable tooling. No feature creep. Every addition must earn its place.
-
-- **UI/UX polish** — improve visibility of running subagents: clearer status lines, better progress feedback, agent name + task always visible during execution
-- ~~**Background subagents**~~ ✔ shipped in v0.4.0 — fire-and-forget with `background: true`, poll/cancel/detach support
-
-## Notes
-
-- Async/background isolation not supported in-process
-- Git worktree isolation not supported
-- Nested subagent depth limited to 2 by default
 
 ## Publish
 
