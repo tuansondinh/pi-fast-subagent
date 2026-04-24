@@ -36,9 +36,19 @@
     "agents.ts",
     "background-job-manager.ts",
     "background-types.ts",
+    "format.ts",
+    "loader-pool.ts",
+    "render.ts",
+    "runner.ts",
+    "schemas.ts",
+    "types.ts",
     "agents/*.md",
     "README.md"
   ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
   "pi": {
     "extensions": [
       "./index.ts"

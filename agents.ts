@@ -48,7 +48,7 @@ export function agentNeedsExtensions(tools: AgentTools): boolean {
 
 // Default: all tools, matching pi-subagents behavior. Agents opt into lean mode
 // with `tools: builtins` or explicit built-in allowlists.
-function parseToolsField(raw: unknown): AgentTools {
+export function parseToolsField(raw: unknown): AgentTools {
   if (raw === undefined || raw === null) return "all";
   const str = String(raw).trim();
   if (!str) return "all";
@@ -60,7 +60,7 @@ function parseToolsField(raw: unknown): AgentTools {
   return list.length ? list : "all";
 }
 
-function parseMaxDepthField(raw: unknown): number {
+export function parseMaxDepthField(raw: unknown): number {
   if (raw === undefined || raw === null || raw === "") return 0;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return 0;

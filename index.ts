@@ -4,116 +4,38 @@
  * Uses createAgentSession() to run subagents in the same process as pi —
  * no subprocess spawn, no cold-start overhead.
  *
- * Supports: single, parallel.
+ * Supports: single, parallel, background.
  * Agent .md files are compatible with pi-subagents frontmatter format.
  */
 
 import { randomUUID } from "node:crypto";
-import type {
-  AgentToolResult,
-  AgentToolUpdateCallback,
-  ExtensionAPI,
-  ExtensionContext,
-  ResourceLoader,
-  ToolRenderResultOptions,
-} from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext, ToolRenderResultOptions } from "@mariozechner/pi-coding-agent";
+import { Theme } from "@mariozechner/pi-coding-agent";
+import { Key } from "@mariozechner/pi-tui";
+
+import { type AgentConfig, discoverAgents } from "./agents.js";
 import { BackgroundJobManager } from "./background-job-manager.js";
 import type { BackgroundHandleLike, BackgroundJobResult, BackgroundSubagentJob } from "./background-types.js";
-import { Theme } from "@mariozechner/pi-coding-agent";
-import { Key, truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
-import { truncateToVisualLines, keyHint } from "@mariozechner/pi-coding-agent";
 import {
-  AuthStorage,
-  createAgentSession,
-  DefaultResourceLoader,
-  getAgentDir,
-  ModelRegistry,
-  SessionManager,
-} from "@mariozechner/pi-coding-agent";
+  formatBgJobDetails,
+  formatBgJobSummary,
+  formatDuration,
+  formatTools,
+  getFinalText,
+  summarizeTask,
+} from "./format.js";
+import { defaultLoaderPool } from "./loader-pool.js";
+import { renderSubagentResult } from "./render.js";
+import { getCurrentDepth, mapConcurrent, runAgent } from "./runner.js";
+import { SubagentParams } from "./schemas.js";
+import type { AgentRowStatus, OnUpdate, RunResult, SubagentDetails, ToolCallEntry } from "./types.js";
 
-type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
-import { Type } from "@sinclair/typebox";
-import { type AgentConfig, agentNeedsExtensions, discoverAgents } from "./agents.js";
+// ─── Module-level state ─────────────────────────────────────────────────────
 
-function formatTools(tools: AgentConfig["tools"]): string {
-  if (tools === "all") return "all";
-  if (tools === "builtins") return "builtins (default)";
-  if (tools === "none") return "none";
-  return tools.join(", ");
-}
-
-// ─── Tool arg summarizer (compact one-liner per tool call) ─────────────────────
-
-function shortPath(p: unknown): string {
-  if (typeof p !== "string") return "";
-  const cwd = process.cwd();
-  if (p.startsWith(cwd + "/")) return p.slice(cwd.length + 1);
-  return p.replace(/^\/Users\/[^/]+\/[^/]+\//, "");
-}
-
-function summarizeToolArgs(toolName: unknown, toolInput: unknown): string {
-  const name = String(toolName ?? "");
-  const input =
-    toolInput && typeof toolInput === "object" ? (toolInput as Record<string, unknown>) : {};
-  const filePath = (): string => shortPath(input.path ?? input.file_path) || "";
-  switch (name) {
-    case "Read":
-    case "read":
-    case "Write":
-    case "write":
-    case "Edit":
-    case "edit":
-      return filePath();
-    case "Bash":
-    case "bash": {
-      const cmd = String(input.command ?? "");
-      return cmd.length > 80 ? cmd.slice(0, 77) + "..." : cmd;
-    }
-    case "Glob":
-    case "glob":
-      return String(input.pattern ?? "");
-    case "find": {
-      const pat = String(input.pattern ?? "");
-      const p = shortPath(input.path);
-      return p ? `${pat} in ${p}` : pat;
-    }
-    case "Grep":
-    case "grep": {
-      const pat = String(input.pattern ?? "");
-      const g = input.glob ? ` ${input.glob}` : "";
-      return `${pat}${g}`;
-    }
-    case "ls":
-      return shortPath(input.path) || "";
-    case "subagent": {
-      const agent = String(input.agent ?? "");
-      const t = String(input.task ?? "");
-      const summary = t.length > 50 ? t.slice(0, 47) + "..." : t;
-      return agent ? `${agent}: ${summary}` : summary;
-    }
-    default: {
-      for (const v of Object.values(input)) {
-        if (typeof v === "string" && v.length > 0)
-          return v.length > 60 ? v.slice(0, 57) + "..." : v;
-      }
-      return "";
-    }
-  }
-}
-
-// ─── Shared auth (created once, reused across calls) ─────────────────────────
-
-let _authStorage: ReturnType<typeof AuthStorage.create> | null = null;
-let _modelRegistry: ReturnType<typeof ModelRegistry.create> | null = null;
 let _bgManager: BackgroundJobManager | null = null;
 let _onBgJobComplete: ((job: BackgroundSubagentJob) => void) | null = null;
 let _setBgStatus: ((text: string | undefined) => void) | null = null;
-
-function getAuth() {
-  if (!_authStorage) _authStorage = AuthStorage.create();
-  if (!_modelRegistry) _modelRegistry = ModelRegistry.create(_authStorage);
-  return { authStorage: _authStorage, modelRegistry: _modelRegistry };
-}
 
 function getBgManager(): BackgroundJobManager {
   if (!_bgManager) _bgManager = new BackgroundJobManager({
@@ -127,575 +49,21 @@ function refreshBgStatus(): void {
   _setBgStatus?.(running.length > 0 ? `⧗ ${running.length} bg agent${running.length > 1 ? "s" : ""}` : undefined);
 }
 
-// ─── Resource loader pool ─────────────────────────────────────────────────────
-
-interface LoaderPoolEntry {
-  idle: DefaultResourceLoader[];
-  active: Set<DefaultResourceLoader>;
-  warming: Set<Promise<void>>;
-}
-
-interface LoaderLease {
-  loader: ResourceLoader;
-  release: () => void;
-}
-
-const _loaderPool = new Map<string, LoaderPoolEntry>();
-
-function loaderPoolKey(cwd: string, agentDir: string, noExtensions: boolean): string {
-  return `${cwd}\0${agentDir}\0${noExtensions ? "noext" : "ext"}`;
-}
-
-function getLoaderPoolEntry(cwd: string, agentDir: string, noExtensions: boolean): LoaderPoolEntry {
-  const key = loaderPoolKey(cwd, agentDir, noExtensions);
-  let entry = _loaderPool.get(key);
-  if (!entry) {
-    entry = { idle: [], active: new Set(), warming: new Set() };
-    _loaderPool.set(key, entry);
-  }
-  return entry;
-}
-
-function makeLoaderOptions(cwd: string, agentDir: string, noExtensions: boolean): DefaultResourceLoaderOptions {
-  return {
-    cwd,
-    agentDir,
-    noExtensions,
-    noContextFiles: true,
-    noSkills: true,
-  };
-}
-
-class AgentPromptResourceLoader implements ResourceLoader {
-  constructor(
-    private readonly base: ResourceLoader,
-    private readonly systemPromptOverride: string | undefined,
-  ) {}
-
-  getExtensions() { return this.base.getExtensions(); }
-  getSkills() { return this.base.getSkills(); }
-  getPrompts() { return this.base.getPrompts(); }
-  getThemes() { return this.base.getThemes(); }
-  getAgentsFiles() { return this.base.getAgentsFiles(); }
-  getSystemPrompt() { return this.systemPromptOverride ?? this.base.getSystemPrompt(); }
-  getAppendSystemPrompt() { return this.base.getAppendSystemPrompt(); }
-  extendResources(paths: Parameters<ResourceLoader["extendResources"]>[0]): void { this.base.extendResources(paths); }
-  reload(): Promise<void> { return this.base.reload(); }
-}
-
-function isLoaderWarm(cwd: string, agentDir: string, noExtensions: boolean): boolean {
-  const entry = _loaderPool.get(loaderPoolKey(cwd, agentDir, noExtensions));
-  return !!entry && entry.idle.length > 0;
-}
-
-async function allowUiPaint(coldLoader: boolean): Promise<void> {
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  if (!coldLoader) return;
-  // Give pi's TUI render timer a real timers-phase turn before CPU-heavy extension loading.
-  await new Promise<void>((resolve) => setTimeout(resolve, 50));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-}
-
-async function acquireResourceLoader(
-  cwd: string,
-  agentDir: string,
-  noExtensions: boolean,
-  systemPromptOverride: string | undefined,
-): Promise<LoaderLease> {
-  const entry = getLoaderPoolEntry(cwd, agentDir, noExtensions);
-
-  while (true) {
-    const cached = entry.idle.pop();
-    if (cached) {
-      entry.active.add(cached);
-      let released = false;
-      return {
-        loader: new AgentPromptResourceLoader(cached, systemPromptOverride),
-        release: () => {
-          if (released) return;
-          released = true;
-          entry.active.delete(cached);
-          entry.idle.push(cached);
-        },
-      };
-    }
-
-    const warming = entry.warming.values().next().value as Promise<void> | undefined;
-    if (warming) {
-      await warming;
-      continue;
-    }
-
-    const loader = new DefaultResourceLoader(makeLoaderOptions(cwd, agentDir, noExtensions));
-    const warmPromise = loader.reload()
-      .then(() => { entry.idle.push(loader); })
-      .finally(() => { entry.warming.delete(warmPromise); });
-    entry.warming.add(warmPromise);
-    await warmPromise;
-  }
-}
-
-function warmResourceLoader(cwd: string, agentDir: string, noExtensions: boolean): void {
-  const entry = getLoaderPoolEntry(cwd, agentDir, noExtensions);
-  if (entry.idle.length > 0 || entry.active.size > 0 || entry.warming.size > 0) return;
-  const loader = new DefaultResourceLoader(makeLoaderOptions(cwd, agentDir, noExtensions));
-  const warmPromise = loader.reload()
-    .then(() => { entry.idle.push(loader); })
-    .catch(() => { /* ignore warm failures; foreground call reports real error */ })
-    .finally(() => { entry.warming.delete(warmPromise); });
-  entry.warming.add(warmPromise);
-}
-
-// ─── Foreground detach registry ───────────────────────────────────────────────
+// ─── Foreground detach registry ─────────────────────────────────────────────
 
 interface ForegroundDetachEntry {
   agentName: string;
   task: string;
-  detach: () => string; // returns bg job id
+  detach: () => string;
 }
 const _fgJobs = new Map<string, ForegroundDetachEntry>();
 
-// ─── In-process runner ───────────────────────────────────────────────────────
-
-const DEFAULT_MAX_DEPTH = 0;
-const DEPTH_ENV = "PI_FAST_SUBAGENT_DEPTH";
-const MAX_DEPTH_ENV = "PI_FAST_SUBAGENT_MAX_DEPTH";
-
-interface ToolCallEntry {
-  id: string;
-  name: string;
-  argSummary: string;
-  result?: string;
-  isError?: boolean;
-  durMs?: number;
-}
-
-interface RunResult {
-  output: string;
-  exitCode: number;
-  error?: string;
-  model?: string;
-  toolCalls: ToolCallEntry[];
-  usage: { input: number; output: number; cost: number; turns: number };
-}
-
-interface AgentRowStatus {
-  name: string;
-  taskSummary: string;
-  status: "pending" | "running" | "done" | "error";
-  durMs?: number;
-  toolCalls?: ToolCallEntry[];
-  responseText?: string;
-}
-
-interface SubagentDetails {
-  mode?: "single" | "parallel";
-  agentName?: string;
-  task?: string;
-  // parallel
-  parallelAgents?: AgentRowStatus[];
-  usage: RunResult["usage"];
-  running: boolean;
-  elapsedMs?: number;
-  model?: string;
-  backgroundJobId?: string;
-  toolCalls: ToolCallEntry[];
-}
-
-type OnUpdate = (partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void;
-
-function formatDuration(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  return m > 0 ? `${m}m ${rem}s` : `${rem}s`;
-}
-
-function summarizeTask(task: string, max = 60): string {
-  return task.length > max ? task.slice(0, max - 3) + "..." : task;
-}
-
-function formatBgJobSummary(job: BackgroundSubagentJob, now = Date.now()): string {
-  const dur = job.completedAt ? formatDuration(job.completedAt - job.startedAt) : formatDuration(now - job.startedAt);
-  return `${job.id} [${job.status}] ${job.agentName} · ${dur} · ${summarizeTask(job.task)}`;
-}
-
-function formatBgJobDetails(job: BackgroundSubagentJob, now = Date.now()): string {
-  const dur = job.completedAt ? formatDuration(job.completedAt - job.startedAt) : formatDuration(now - job.startedAt);
-  const lines = [`${job.id} [${job.status}] ${job.agentName} · ${dur}`, `Task: ${job.task}`];
-  if (job.model) lines.push(`Model: ${job.model}`);
-  if (job.status === "completed") lines.push(`\nResult:\n${job.resultSummary ?? "(no output)"}`);
-  if (job.status === "failed") lines.push(`\nError: ${job.error ?? "(unknown)"}`);
-  if (job.status === "cancelled") lines.push("\nCancelled.");
-  if (job.status === "running") lines.push("\nStill running.");
-  return lines.join("\n");
-}
-
-// Module-level depth counters for nested in-process subagent calls.
-let _currentDepth = 0;
-let _currentMaxDepth = DEFAULT_MAX_DEPTH;
-
-async function runAgent(
-  agent: AgentConfig,
-  task: string,
-  cwd: string,
-  modelOverride: string | undefined,
-  signal: AbortSignal | undefined,
-  onUpdate: OnUpdate | undefined,
-  parentDepth?: number,
-): Promise<RunResult> {
-  const depth = parentDepth ?? _currentDepth;
-  const isNestedCall = depth > 0;
-  if (isNestedCall && depth > _currentMaxDepth) {
-    return {
-      output: "",
-      exitCode: 1,
-      error: `Nested subagents are disabled by default. Set maxDepth: ${depth} (or higher) in the parent agent frontmatter to allow this call.`,
-      toolCalls: [],
-      usage: { input: 0, output: 0, cost: 0, turns: 0 },
-    };
-  }
-
-  const bootStartedAt = Date.now();
-  const { authStorage, modelRegistry } = getAuth();
-  const agentDir = getAgentDir();
-  const noExtensions = !agentNeedsExtensions(agent.tools);
-  const coldLoader = !isLoaderWarm(cwd, agentDir, noExtensions);
-
-  // Fire an immediate "running" emit so the UI draws the agent header + prompt
-  // before the (potentially slow) extension/session load. Without this, pi looks
-  // frozen while `loader.reload()` and `createAgentSession()` are in flight.
-  onUpdate?.({
-    content: [{ type: "text", text: "" }],
-    details: {
-      agentName: agent.name,
-      task,
-      usage: { input: 0, output: 0, cost: 0, turns: 0 },
-      running: true,
-      elapsedMs: 0,
-      model: modelOverride ?? agent.model,
-      toolCalls: [],
-    } satisfies SubagentDetails,
-  });
-  // Yield through timers when loader is cold so pi's render loop paints before
-  // CPU-heavy extension loading runs.
-  await allowUiPaint(coldLoader);
-
-  const loaderLease = await acquireResourceLoader(
-    cwd,
-    agentDir,
-    noExtensions,
-    agent.systemPrompt || undefined,
-  );
-
-  let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
-  try {
-    const created = await createAgentSession({
-      cwd,
-      agentDir,
-      sessionManager: SessionManager.inMemory(cwd),
-      authStorage,
-      modelRegistry,
-      resourceLoader: loaderLease.loader,
-    });
-    session = created.session;
-  } catch (e) {
-    loaderLease.release();
-    return {
-      output: "",
-      exitCode: 1,
-      error: e instanceof Error ? e.message : String(e),
-      toolCalls: [],
-      usage: { input: 0, output: 0, cost: 0, turns: 0 },
-    };
-  }
-
-  // Resolve and apply model
-  const modelStr = modelOverride ?? agent.model;
-  if (modelStr) {
-    const [provider, ...rest] = modelStr.split("/");
-    const modelId = rest.join("/");
-    if (provider && modelId) {
-      const model = modelRegistry.find(provider, modelId);
-      if (model) await session.setModel(model);
-    }
-  }
-
-  // Apply tools allowlist.
-  //   "all"    → no restriction (everything registered stays active)
-  //   "none"   → disable every tool
-  //   string[] → explicit allowlist
-  if (agent.tools === "none") {
-    session.setActiveToolsByName([]);
-  } else if (Array.isArray(agent.tools) && agent.tools.length > 0) {
-    session.setActiveToolsByName(agent.tools);
-  }
-
-  // Track output and usage
-  const usage = { input: 0, output: 0, cost: 0, turns: 0 };
-  let lastOutput = "";
-  let currentDelta = "";
-  let detectedModel: string | undefined;
-  const startedAt = bootStartedAt;
-  const configuredModel = modelOverride ?? agent.model;
-  const toolCalls: ToolCallEntry[] = [];
-  const toolStartTimes = new Map<string, number>();
-
-  let done = false;
-
-  function emitUpdate(): void {
-    if (done) return;
-    onUpdate?.({
-      content: [{ type: "text", text: currentDelta || lastOutput || "" }],
-      details: {
-        agentName: agent.name,
-        task,
-        usage,
-        running: true,
-        elapsedMs: Date.now() - startedAt,
-        model: detectedModel ?? configuredModel,
-        toolCalls: [...toolCalls],
-      } satisfies SubagentDetails,
-    });
-  }
-
-  emitUpdate();
-
-  const heartbeat = setInterval(emitUpdate, 1000);
-
-  const unsubscribe = session.subscribe((event: any) => {
-    // Stream tool execution events
-    if (event.type === "tool_execution_start") {
-      toolStartTimes.set(event.toolCallId, Date.now());
-      toolCalls.push({
-        id: event.toolCallId,
-        name: event.toolName,
-        argSummary: summarizeToolArgs(event.toolName, event.args),
-      });
-      emitUpdate();
-      return;
-    }
-
-    if (event.type === "tool_execution_end") {
-      const startedAtTool = toolStartTimes.get(event.toolCallId);
-      toolStartTimes.delete(event.toolCallId);
-      const resultText: string = (event.result?.content ?? [])
-        .filter((p: any) => p.type === "text")
-        .map((p: any) => p.text as string)
-        .join("\n");
-      let entry: ToolCallEntry | undefined;
-      for (let i = toolCalls.length - 1; i >= 0; i--) {
-        if (toolCalls[i]!.id === event.toolCallId) { entry = toolCalls[i]; break; }
-      }
-      if (!entry) {
-        for (let i = toolCalls.length - 1; i >= 0; i--) {
-          if (toolCalls[i]!.name === event.toolName && toolCalls[i]!.result === undefined) { entry = toolCalls[i]; break; }
-        }
-      }
-      if (entry) {
-        entry.result = resultText;
-        entry.isError = event.isError;
-        entry.durMs = startedAtTool != null ? Date.now() - startedAtTool : undefined;
-      }
-      emitUpdate();
-      return;
-    }
-
-    // Stream text deltas live to the UI
-    if (event.type === "message_update") {
-      const e = event.assistantMessageEvent;
-      if (e?.type === "text_delta" && e.delta) {
-        currentDelta += e.delta;
-        emitUpdate();
-      }
-      return;
-    }
-
-    if (event.type !== "message_end" || !event.message) return;
-    const msg = event.message;
-    if (msg.role !== "assistant") return; // usage/model only tracked for assistant turns
-
-    usage.turns++;
-    const u = msg.usage;
-    if (u) {
-      usage.input += u.input ?? 0;
-      usage.output += u.output ?? 0;
-      usage.cost += u.cost?.total ?? 0;
-    }
-    if (msg.model) detectedModel = msg.model;
-
-    // Extract last text content
-    for (const part of msg.content ?? []) {
-      if (part.type === "text") {
-        lastOutput = part.text;
-        break;
-      }
-    }
-    // Reset delta accumulator for next turn
-    currentDelta = "";
-
-    onUpdate?.({
-      content: [{ type: "text", text: lastOutput || "(running...)" }],
-      details: {
-        agent: agent.name,
-        usage,
-        running: true,
-        elapsedMs: Date.now() - startedAt,
-        model: detectedModel ?? configuredModel,
-      },
-    });
-  });
-
-  // Propagate depth to nested calls. `maxDepth` is per-agent and defaults to 0,
-  // so subagents cannot spawn subagents unless their frontmatter opts in.
-  const prevEnvDepth = process.env[DEPTH_ENV];
-  const prevEnvMaxDepth = process.env[MAX_DEPTH_ENV];
-  const prevDepth = _currentDepth;
-  const prevMaxDepth = _currentMaxDepth;
-  const maxDepth = Math.max(DEFAULT_MAX_DEPTH, agent.maxDepth ?? DEFAULT_MAX_DEPTH);
-  _currentDepth = depth + 1;
-  _currentMaxDepth = depth + maxDepth;
-  process.env[DEPTH_ENV] = String(_currentDepth);
-  process.env[MAX_DEPTH_ENV] = String(_currentMaxDepth);
-
-  let exitCode = 0;
-  let error: string | undefined;
-
-  try {
-    if (signal?.aborted) throw new Error("Aborted");
-
-    const onAbort = () => void session.abort();
-    signal?.addEventListener("abort", onAbort, { once: true });
-    try {
-      await session.prompt(task);
-    } finally {
-      signal?.removeEventListener("abort", onAbort);
-    }
-  } catch (e) {
-    exitCode = 1;
-    error = signal?.aborted ? "Aborted" : e instanceof Error ? e.message : String(e);
-  } finally {
-    done = true;
-    clearInterval(heartbeat);
-    unsubscribe();
-    session.dispose();
-    loaderLease.release();
-    if (prevEnvDepth === undefined) delete process.env[DEPTH_ENV];
-    else process.env[DEPTH_ENV] = prevEnvDepth;
-    if (prevEnvMaxDepth === undefined) delete process.env[MAX_DEPTH_ENV];
-    else process.env[MAX_DEPTH_ENV] = prevEnvMaxDepth;
-    _currentDepth = prevDepth;
-    _currentMaxDepth = prevMaxDepth;
-  }
-
-  return { output: lastOutput, exitCode, error, model: detectedModel, toolCalls, usage };
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-async function mapConcurrent<TIn, TOut>(
-  items: TIn[],
-  concurrency: number,
-  fn: (item: TIn, i: number) => Promise<TOut>,
-): Promise<TOut[]> {
-  if (!items.length) return [];
-  const limit = Math.max(1, Math.min(concurrency, items.length));
-  const results: TOut[] = new Array(items.length);
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: limit }, async () => {
-      while (true) {
-        const i = next++;
-        if (i >= items.length) return;
-        results[i] = await fn(items[i], i);
-      }
-    }),
-  );
-  return results;
-}
-
-function formatTokens(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
-  return `${Math.round(n / 1000)}k`;
-}
-
-function formatUsage(usage: RunResult["usage"], model?: string): string {
-  const parts: string[] = [];
-  if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-  if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-  if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-  if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-  if (model) parts.push(model);
-  return parts.join(" ");
-}
-
-function getFinalText(r: RunResult): string {
-  if (r.exitCode !== 0) return `Error: ${r.error ?? r.output ?? "(no output)"}`;
-  return r.output || "(no output)";
-}
-
-// ─── Tool schemas ─────────────────────────────────────────────────────────────
-
-const TaskItem = Type.Object({
-  agent: Type.String({ description: "Agent name" }),
-  task: Type.String({ description: "Task to delegate" }),
-  model: Type.Optional(Type.String({ description: "Model override (provider/model)" })),
-  cwd: Type.Optional(Type.String({ description: "Working directory" })),
-  count: Type.Optional(Type.Number({ description: "Repeat this task N times" })),
-});
-
-const SubagentParams = Type.Object({
-  // Single mode
-  agent: Type.Optional(Type.String({ description: "Agent name (single mode)" })),
-  task: Type.Optional(Type.String({ description: "Task (single mode)" })),
-  model: Type.Optional(Type.String({ description: "Model override (single mode)" })),
-  cwd: Type.Optional(Type.String({ description: "Working directory" })),
-
-  // Parallel mode
-  tasks: Type.Optional(
-    Type.Array(TaskItem, {
-      description: "Array of {agent, task} for parallel execution. Use count to repeat one task.",
-    }),
-  ),
-  concurrency: Type.Optional(
-    Type.Number({ description: "Max parallel concurrency (default: 4)", default: 4 }),
-  ),
-
-  // Background
-  background: Type.Optional(Type.Boolean({ description: "Run in background, returns job ID immediately" })),
-  jobId: Type.Optional(Type.String({ description: "Job ID for poll/cancel" })),
-
-  // Management
-  action: Type.Optional(
-    Type.Union(
-      [
-        Type.Literal("list"),
-        Type.Literal("get"),
-        Type.Literal("status"),
-        Type.Literal("poll"),
-        Type.Literal("cancel"),
-        Type.Literal("detach"),
-      ],
-      { description: "'list'/'get' for agents, 'status' for bg jobs, 'poll'/'cancel' for a specific job, 'detach' to move a foreground job to background" },
-    ),
-  ),
-  agentScope: Type.Optional(
-    Type.Union(
-      [Type.Literal("user"), Type.Literal("project"), Type.Literal("both")],
-      { description: "Agent scope filter", default: "both" },
-    ),
-  ),
-});
-
-// ─── Extension entry point ────────────────────────────────────────────────────
+// ─── Extension entry point ──────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // ─── Status keys ────────────────────────────────────────────────────────────────────
   const BG_STATUS_KEY = "fast-subagent-bg";
   const FG_STATUS_KEY = "fast-subagent-fg";
 
-  // ─── Background job lifecycle ─────────────────────────────────────────────────────
   _onBgJobComplete = (job) => {
     refreshBgStatus();
     const elapsed = job.completedAt ? ((job.completedAt - job.startedAt) / 1000).toFixed(1) : "?";
@@ -719,12 +87,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     _setBgStatus = (text) => ctx.ui.setStatus(BG_STATUS_KEY, text);
 
-    // Warm one extension-capable loader after startup. First `tools: all` subagent
-    // call can then reuse loaded extensions instead of blocking before first stream.
+    // Warm one extension-capable loader after startup so first `tools: all`
+    // subagent call reuses loaded extensions instead of blocking.
     if (process.env.PI_FAST_SUBAGENT_WARM !== "0") {
       const warmCwd = ctx.cwd;
       const warmAgentDir = getAgentDir();
-      setTimeout(() => warmResourceLoader(warmCwd, warmAgentDir, false), 1000);
+      setTimeout(() => defaultLoaderPool.warm(warmCwd, warmAgentDir, false), 1000);
     }
   });
 
@@ -732,10 +100,10 @@ export default function (pi: ExtensionAPI) {
     getBgManager().shutdown();
     _bgManager = null;
     _setBgStatus = null;
-    _loaderPool.clear();
+    defaultLoaderPool.clear();
   });
 
-  // ─── Ctrl+Shift+B — move foreground subagent to background ─────────────────────────
+  // ─── Ctrl+Shift+B — detach foreground subagent ────────────────────────────
   pi.registerShortcut(Key.ctrlShift("b"), {
     description: "Move foreground subagent to background",
     handler: async (ctx) => {
@@ -756,7 +124,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ─── /agent slash command ─────────────────────────────────────────────────
+  // ─── /fast-subagent:agent ─────────────────────────────────────────────────
   pi.registerCommand("fast-subagent:agent", {
     description: "List available subagents. Usage: /fast-subagent:agent [name] — show details for a specific agent.",
     getArgumentCompletions(prefix: string) {
@@ -796,7 +164,7 @@ export default function (pi: ExtensionAPI) {
           "  ~/.pi/agent/agents/   (user-level)\n" +
           "  .pi/agents/           (project-level)\n" +
           "\nFrontmatter required: name, description. Optional: model, tools, maxDepth.",
-          "info"
+          "info",
         );
         return;
       }
@@ -807,15 +175,11 @@ export default function (pi: ExtensionAPI) {
       const lines: string[] = [`Agents (${agents.length}):`];
       if (projectAgents.length) {
         lines.push("\nProject (.pi/agents/):");
-        for (const a of projectAgents) {
-          lines.push(`  ${a.name}${a.model ? ` [${a.model}]` : ""} — ${a.description}`);
-        }
+        for (const a of projectAgents) lines.push(`  ${a.name}${a.model ? ` [${a.model}]` : ""} — ${a.description}`);
       }
       if (userAgents.length) {
         lines.push("\nUser (~/.pi/agent/agents/):");
-        for (const a of userAgents) {
-          lines.push(`  ${a.name}${a.model ? ` [${a.model}]` : ""} — ${a.description}`);
-        }
+        for (const a of userAgents) lines.push(`  ${a.name}${a.model ? ` [${a.model}]` : ""} — ${a.description}`);
       }
       lines.push("");
       lines.push("Tip: /fast-subagent:agent <name> for details · Add .md files to .pi/agents/ to create new agents");
@@ -823,7 +187,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ─── /bg slash command ────────────────────────────────────────────────────
+  // ─── /fast-subagent:bg ────────────────────────────────────────────────────
   pi.registerCommand("fast-subagent:bg", {
     description: "Move a running foreground subagent to background. Shortcut: Ctrl+Shift+B. Usage: /fast-subagent:bg [fg-job-id] — omit ID to list active foreground jobs.",
     getArgumentCompletions(_prefix: string) {
@@ -849,14 +213,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const bgJobId = entry.detach();
-      ctx.ui.notify(
-        `Moved to background: ${bgJobId}\nTo check status, ask me to poll job ${bgJobId}.`,
-        "info",
-      );
+      ctx.ui.notify(`Moved to background: ${bgJobId}\nTo check status, ask me to poll job ${bgJobId}.`, "info");
     },
   });
 
-  // ─── /bg-status slash command ─────────────────────────────────────────────
+  // ─── /fast-subagent:bg-status ─────────────────────────────────────────────
   pi.registerCommand("fast-subagent:bg-status", {
     description: "Show active background subagents. Usage: /fast-subagent:bg-status [sa-job-id] — omit ID to open selector.",
     getArgumentCompletions(prefix: string) {
@@ -896,7 +257,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ─── /bg-cancel slash command ─────────────────────────────────────────────
+  // ─── /fast-subagent:bg-cancel ─────────────────────────────────────────────
   pi.registerCommand("fast-subagent:bg-cancel", {
     description: "Cancel running background subagent. Usage: /fast-subagent:bg-cancel [sa-job-id] — omit ID to choose with arrow keys.",
     getArgumentCompletions(prefix: string) {
@@ -944,6 +305,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ─── `subagent` tool ──────────────────────────────────────────────────────
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
@@ -955,209 +317,11 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     parameters: SubagentParams,
 
-    renderResult(result: AgentToolResult<unknown>, { isPartial, expanded }: ToolRenderResultOptions, theme: Theme) {
-      const agentText = result.content?.[0]?.type === "text" ? (result.content[0] as any).text as string : "";
-      const details = (result.details ?? {}) as SubagentDetails;
-      const toolCalls = details.toolCalls ?? [];
-
-      // ── Parallel / Chain mode renders ────────────────────────────────
-      if (details.mode === "parallel" && details.parallelAgents) {
-        const agents = details.parallelAgents;
-        const doneCount = agents.filter((a) => a.status === "done" || a.status === "error").length;
-
-        function agentToolRow(t: ToolCallEntry): string {
-          const arg = t.argSummary || "";
-          const call = `${t.name}(${arg})`;
-          if (t.result === undefined) return theme.fg("dim", call);
-          const dur = t.durMs != null ? (t.durMs < 1000 ? ` ${t.durMs}ms` : ` ${(t.durMs / 1000).toFixed(1)}s`) : "";
-          return `${call}${t.isError ? " ✗" : ` ✓${dur}`}`;
-        }
-
-        function wrapL(text: string, w: number): string[] {
-          try { return wrapTextWithAnsi(text, w); } catch { return [truncateToWidth(text, w, "...")]; }
-        }
-
-        const cache: { width?: number } = {};
-        return {
-          invalidate() { cache.width = undefined; },
-          render(width: number): string[] {
-            const out: string[] = [];
-            const header = details.running
-              ? `Parallel (${doneCount}/${agents.length} done)`
-              : `Parallel: ${agents.filter((a) => a.status === "done").length}/${agents.length} succeeded`;
-            out.push(truncateToWidth(header, width, "..."));
-
-            for (const a of agents) {
-              const dur = a.durMs != null ? (a.durMs < 1000 ? ` ${a.durMs}ms` : ` ${(a.durMs / 1000).toFixed(1)}s`) : "";
-              const mark = a.status === "pending" ? theme.fg("dim", "⋅") : a.status === "running" ? theme.fg("dim", "→") : a.status === "done" ? `✓${dur}` : `✗${dur}`;
-
-              if (expanded) {
-                // Full solo-style block per agent
-                out.push("");
-                out.push(truncateToWidth(`[${a.name}] ${mark}`, width, "..."));
-                out.push(truncateToWidth(`Prompt:`, width, "..."));
-                out.push(truncateToWidth(`  ${a.taskSummary}`, width, "..."));
-                for (const t of a.toolCalls ?? []) {
-                  out.push(truncateToWidth(agentToolRow(t), width, "..."));
-                }
-                if (a.responseText) {
-                  out.push("Response:");
-                  const preview = truncateToVisualLines(a.responseText, 6, width - 2);
-                  for (const l of preview.visualLines) out.push(truncateToWidth("  " + l, width, "..."));
-                  if (preview.skippedCount > 0) out.push(truncateToWidth(theme.fg("dim", `  … ${preview.skippedCount} more lines`), width, "..."));
-                } else if (a.status === "running") {
-                  out.push(theme.fg("dim", "  running..."));
-                }
-              } else {
-                // Collapsed: compact one-liner
-                const row = `  [${a.name}] ${mark}  ${a.taskSummary}`;
-                out.push(truncateToWidth(row, width, "..."));
-                // Show tool call rows compactly
-                for (const t of a.toolCalls ?? []) {
-                  out.push(truncateToWidth(`    ${agentToolRow(t)}`, width, "..."));
-                }
-                if (a.responseText && (a.status === "done" || a.status === "error")) {
-                  const preview = truncateToVisualLines(a.responseText, 2, width - 4);
-                  for (const l of preview.visualLines) out.push(truncateToWidth("    " + l, width, "..."));
-                }
-              }
-            }
-
-            out.push("");
-            const status = details.running
-              ? ["running", details.usage?.turns ? `${details.usage.turns} turn${details.usage.turns > 1 ? "s" : ""}` : ""].filter(Boolean).join(" · ")
-              : formatUsage(details.usage ?? { input: 0, output: 0, cost: 0, turns: 0 }, details.model);
-            const expandHint = !expanded ? keyHint("app.tools.expand", "expand for full output") : "";
-            out.push(truncateToWidth([status, expandHint].filter(Boolean).join("  "), width, "..."));
-            return out;
-          },
-        };
-      }
-
-      function statusLine(): string {
-        if (details.backgroundJobId) return `moved to background · ${details.backgroundJobId}`;
-        const prefix = details.agentName ? `${theme.fg("toolTitle", details.agentName)} · ` : "";
-        if (details.running) {
-          const parts: string[] = ["running"];
-          if (details.usage?.turns) parts.push(`${details.usage.turns} turn${details.usage.turns > 1 ? "s" : ""}`);
-          if (details.elapsedMs != null) parts.push(formatDuration(details.elapsedMs));
-          if (details.model) parts.push(details.model);
-          return prefix + parts.join(" · ");
-        }
-        return prefix + formatUsage(details.usage ?? { input: 0, output: 0, cost: 0, turns: 0 }, details.model);
-      }
-
-      // Name(arg) ✓ 0.3s  or  Name(arg)  (dim, still running)
-      function toolRow(t: ToolCallEntry): string {
-        const arg = t.argSummary ? t.argSummary : "";
-        const call = `${t.name}(${arg})`;
-        if (t.result === undefined) return theme.fg("dim", call);
-        const dur = t.durMs != null
-          ? t.durMs < 1000 ? ` ${t.durMs}ms` : ` ${(t.durMs / 1000).toFixed(1)}s`
-          : "";
-        return `${call}${t.isError ? " ✗" : ` ✓${dur}`}`;
-      }
-
-      function wrapLine(text: string, w: number): string[] {
-        try { return wrapTextWithAnsi(text, w); } catch { return [truncateToWidth(text, w, "...")]; }
-      }
-
-      const cache: {
-        width?: number;
-        promptLines?: string[];
-        promptSkipped?: number;
-        responseLines?: string[];
-        skipped?: number;
-      } = {};
-
-      return {
-        invalidate() { cache.width = undefined; },
-        render(width: number): string[] {
-          const out: string[] = [];
-          const indent = "  ";
-          const ellipsisLine = (count: number) =>
-            theme.fg("muted", `${indent}… (${count} more line${count === 1 ? "" : "s"})`);
-
-          // ── Prompt ────────────────────────────────────────────────────
-          if (details.task) {
-            out.push("Prompt:");
-            if (expanded) {
-              for (const line of details.task.split("\n")) {
-                for (const w of wrapLine(indent + line, width)) out.push(w);
-              }
-            } else {
-              // Up to 8 visual lines from the HEAD of the prompt (keep opening, not tail).
-              const PROMPT_PREVIEW_LINES = 8;
-              if (cache.width !== width || cache.promptLines === undefined) {
-                const innerWidth = Math.max(1, width - indent.length);
-                const allVisual: string[] = [];
-                for (const raw of details.task.split("\n")) {
-                  for (const w of wrapLine(raw, innerWidth)) allVisual.push(w);
-                }
-                const head = allVisual.slice(0, PROMPT_PREVIEW_LINES);
-                cache.promptLines = head.map((l) => truncateToWidth(indent + l, width, "..."));
-                cache.promptSkipped = Math.max(0, allVisual.length - head.length);
-              }
-              out.push(...cache.promptLines);
-              if ((cache.promptSkipped ?? 0) > 0) {
-                out.push(truncateToWidth(ellipsisLine(cache.promptSkipped!), width, "..."));
-              }
-            }
-          }
-
-          // ── Tool calls ─────────────────────────────────────────────
-          for (const t of toolCalls) {
-            out.push(truncateToWidth(toolRow(t), width, "..."));
-            if (expanded && t.result !== undefined) {
-              for (const line of t.result.split("\n")) {
-                for (const w of wrapLine(theme.fg("dim", indent + line), width)) out.push(w);
-              }
-            }
-          }
-
-          // ── Response ────────────────────────────────────────────
-          const responseText = agentText || (isPartial ? "" : "");
-          if (responseText || isPartial) {
-            out.push("Response:");
-            if (expanded) {
-              for (const line of responseText.split("\n")) {
-                for (const w of wrapLine(indent + line, width)) out.push(w);
-              }
-            } else {
-              const PREVIEW_LINES = 6;
-              if (cache.width !== width) {
-                const preview = truncateToVisualLines(responseText, PREVIEW_LINES, width - indent.length);
-                cache.responseLines = preview.visualLines.map((l) => truncateToWidth(indent + l, width, "..."));
-                cache.skipped = preview.skippedCount;
-                cache.width = width;
-              }
-              // truncateToVisualLines keeps the tail — show ellipsis BEFORE the visible lines.
-              if ((cache.skipped ?? 0) > 0) {
-                out.push(truncateToWidth(ellipsisLine(cache.skipped!), width, "..."));
-              }
-              out.push(...(cache.responseLines ?? []));
-            }
-          }
-
-          // ── Status ───────────────────────────────────────────────
-          const status = statusLine();
-          const totalSkipped = (cache.skipped ?? 0) + (cache.promptSkipped ?? 0);
-          const expandHint = !expanded && totalSkipped > 0
-            ? keyHint("app.tools.expand", `expand · ${totalSkipped} lines hidden`)
-            : !expanded && toolCalls.some((t) => t.result !== undefined)
-              ? keyHint("app.tools.expand", "expand for tool outputs")
-              : "";
-          const statusWithHint = [status, expandHint].filter(Boolean).join("  ");
-          if (statusWithHint) out.push(truncateToWidth(statusWithHint, width, "..."));
-          if (details.running && !details.backgroundJobId)
-            out.push(truncateToWidth(theme.fg("dim", "Ctrl+Shift+B: move to background"), width, "..."));
-
-          return out;
-        },
-      };
+    renderResult(result: AgentToolResult<unknown>, opts: ToolRenderResultOptions, theme: Theme) {
+      return renderSubagentResult(result, opts, theme);
     },
 
-    async execute(_id: string, params: Record<string, any>, signal: AbortSignal | undefined, onUpdate: AgentToolUpdateCallback<unknown> | undefined, ctx: ExtensionContext): Promise<any> {
+    async execute(_id: string, params: Record<string, any>, signal: AbortSignal | undefined, onUpdate, ctx: ExtensionContext): Promise<any> {
       const cwd = params.cwd ?? ctx.cwd;
       const agents = discoverAgents(cwd);
 
@@ -1170,7 +334,7 @@ export default function (pi: ExtensionAPI) {
         return { agent: found };
       };
 
-      // ── Management: list ──────────────────────────────────────────────────────
+      // ── Management: list ────────────────────────────────────────────────
       if (params.action === "list" || (!params.action && !params.agent && !params.tasks)) {
         if (agents.length === 0) {
           return {
@@ -1186,7 +350,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Agents (${agents.length}):\n${lines.join("\n")}` }] };
       }
 
-      // ── Management: get ───────────────────────────────────────────────────────
+      // ── Management: get ─────────────────────────────────────────────────
       if (params.action === "get" && params.agent) {
         const { agent, error } = findAgent(params.agent);
         if (error || !agent) return { content: [{ type: "text", text: error ?? "Not found" }] };
@@ -1201,7 +365,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: info }] };
       }
 
-      // ── Background status ───────────────────────────────────────────────────
+      // ── Background status ───────────────────────────────────────────────
       if (params.action === "status") {
         const jobs = getBgManager().getAllJobs();
         if (jobs.length === 0) return { content: [{ type: "text", text: "No background jobs." }] };
@@ -1212,7 +376,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: lines.join("\n") }] };
       }
 
-      // ── Background poll ────────────────────────────────────────────────────────
+      // ── Background poll ─────────────────────────────────────────────────
       if (params.action === "poll") {
         if (!params.jobId) return { content: [{ type: "text", text: "Provide jobId to poll." }] };
         const job = getBgManager().getJob(params.jobId);
@@ -1225,7 +389,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: parts.join("\n") }] };
       }
 
-      // ── Background cancel ──────────────────────────────────────────────────────
+      // ── Background cancel ───────────────────────────────────────────────
       if (params.action === "cancel") {
         if (!params.jobId) return { content: [{ type: "text", text: "Provide jobId to cancel." }] };
         const result = getBgManager().cancel(params.jobId);
@@ -1235,7 +399,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: msg }] };
       }
 
-      // ── Foreground → background detach ────────────────────────────────────────
+      // ── Foreground → background detach ──────────────────────────────────
       if (params.action === "detach") {
         if (!params.jobId) return { content: [{ type: "text", text: "Provide jobId (fg_xxxxx) to detach." }] };
         const fgEntry = _fgJobs.get(params.jobId);
@@ -1244,23 +408,21 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Moved to background: ${bgJobId}\nTo check status, ask me to poll job ${bgJobId}.` }] };
       }
 
-      // ── Single mode ───────────────────────────────────────────────────────────
+      // ── Single mode ─────────────────────────────────────────────────────
       if (params.agent && params.task) {
         const { agent, error } = findAgent(params.agent);
         if (error || !agent) return { content: [{ type: "text", text: error ?? "Not found" }] };
 
-        // Background dispatch — fire and forget
         if (params.background) {
           const bgAbort = new AbortController();
           const handle: BackgroundHandleLike = { abort: () => bgAbort.abort() };
           const resultPromise: Promise<BackgroundJobResult> = runAgent(
-            agent, params.task, cwd, params.model, bgAbort.signal, undefined
+            agent, params.task, cwd, params.model, bgAbort.signal, undefined,
           ).then((r) => ({ summary: r.output, exitCode: r.exitCode, error: r.error, model: r.model }));
           const jobId = getBgManager().adoptHandle(agent.name, params.task, cwd, handle, resultPromise);
           return { content: [{ type: "text", text: `Background job started: ${jobId}\nTo check status, ask me to poll job ${jobId}.` }] };
         }
 
-        // Foreground run with detach support
         const fgId = `fg_${randomUUID().slice(0, 8)}`;
         const agentAbort = new AbortController();
         const forwardAbort = () => agentAbort.abort();
@@ -1269,18 +431,15 @@ export default function (pi: ExtensionAPI) {
         let detachResolveFn: ((bgJobId: string) => void) | null = null;
         const detachPromise = new Promise<string>((resolve) => { detachResolveFn = resolve; });
 
-        // Wrap onUpdate so detach can stop forwarding updates to the parent
-        // agent's listener (which becomes invalid once execute() returns).
         let forwardUpdates = true;
         const wrappedOnUpdate: OnUpdate | undefined = onUpdate
-          ? (partial) => { if (forwardUpdates) onUpdate(partial); }
+          ? (partial) => { if (forwardUpdates) (onUpdate as unknown as OnUpdate)(partial); }
           : undefined;
 
         const agentRunPromise: Promise<RunResult> = runAgent(
           agent, params.task, cwd, params.model, agentAbort.signal, wrappedOnUpdate,
         );
 
-        // Derived promise for the bg manager (used only if we detach)
         const bgResultPromise: Promise<BackgroundJobResult> = agentRunPromise
           .then((r) => ({ summary: r.output, exitCode: r.exitCode, error: r.error, model: r.model }));
 
@@ -1311,7 +470,7 @@ export default function (pi: ExtensionAPI) {
         });
 
         if (outcome === "detached") {
-          const bgJobId = await detachPromise; // already resolved — instant
+          const bgJobId = await detachPromise;
           return {
             content: [{ type: "text", text: `Moved to background: ${bgJobId}. Completion will be announced automatically.` }],
             details: {
@@ -1341,7 +500,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // ── Parallel mode ─────────────────────────────────────────────
+      // ── Parallel mode ───────────────────────────────────────────────────
       if (params.tasks && params.tasks.length > 0) {
         const expanded: Array<{ agent: string; task: string; model?: string; cwd?: string }> = [];
         for (const t of params.tasks) {
@@ -1358,14 +517,14 @@ export default function (pi: ExtensionAPI) {
         }));
         let runningUsage = { ...emptyUsage };
 
-        const emitParallel = (running: boolean) => onUpdate?.({
+        const emitParallel = (running: boolean) => (onUpdate as unknown as OnUpdate | undefined)?.({
           content: [{ type: "text", text: "" }],
           details: { mode: "parallel", parallelAgents: [...parallelAgents], usage: { ...runningUsage }, running, toolCalls: [] } satisfies SubagentDetails,
         });
 
         emitParallel(true);
 
-        const parentDepth = _currentDepth;
+        const parentDepth = getCurrentDepth();
         const allResults = await mapConcurrent(expanded, concurrency, async (t, i) => {
           parallelAgents[i]!.status = "running";
           emitParallel(true);
@@ -1404,8 +563,6 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // ── Chain mode ────────────────────────────────────────────
-      // Shouldn't reach here
       return { content: [{ type: "text", text: "Provide agent+task or tasks array." }] };
     },
   });
