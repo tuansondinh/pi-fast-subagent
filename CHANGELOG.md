@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-04-24
+
+### Features
+- Agent frontmatter `tools:` field supports `all` / `none` / comma-separated allowlist
+- Subagents now inherit parent extensions (web_search, fetch_content, mcp, playwright, …) by default
+- Auto-load extensions when frontmatter allowlist references non-builtin tool names
+- Export `BUILTIN_TOOL_NAMES` constant from `agents.ts`
+
+### Breaking Changes
+- Default subagent now loads parent extensions (previously always lean builtins-only). Agents that want the old behavior must list builtins explicitly: `tools: read, bash, edit, write, grep, find, ls`
+- Bundled `scout` agent updated to the explicit builtins allowlist to preserve lean behavior
+
+### Other
+- README: document `tools:` frontmatter field with examples
+
 ## [0.5.1] - 2026-04-23
 
 ### Other

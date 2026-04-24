@@ -32,7 +32,13 @@ import {
 
 type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
 import { Type } from "@sinclair/typebox";
-import { type AgentConfig, discoverAgents } from "./agents.js";
+import { type AgentConfig, agentNeedsExtensions, discoverAgents } from "./agents.js";
+
+function formatTools(tools: AgentConfig["tools"]): string {
+  if (tools === "all") return "all";
+  if (tools === "none") return "none";
+  return tools.join(", ");
+}
 
 // ─── Tool arg summarizer (compact one-liner per tool call) ─────────────────────
 
@@ -228,11 +234,14 @@ async function runAgent(
   const { authStorage, modelRegistry } = getAuth();
   const agentDir = getAgentDir();
 
-  // Build resource loader — no extensions/context files to keep subagent lean
+  // Build resource loader — no extensions/context files to keep subagent lean.
+  // Agents can opt in to extensions via `extensions: true` in frontmatter, which
+  // makes tools like web_search / fetch_content / mcp / etc. available to the
+  // subagent (subject to the optional `tools:` allowlist below).
   const loaderOptions: DefaultResourceLoaderOptions = {
     cwd,
     agentDir,
-    noExtensions: true,
+    noExtensions: !agentNeedsExtensions(agent.tools),
     noContextFiles: true,
     noSkills: true,
   };
@@ -264,8 +273,13 @@ async function runAgent(
     }
   }
 
-  // Restrict tools if agent specifies them
-  if (agent.tools && agent.tools.length > 0) {
+  // Apply tools allowlist.
+  //   "all"    → no restriction (everything registered stays active)
+  //   "none"   → disable every tool
+  //   string[] → explicit allowlist
+  if (agent.tools === "none") {
+    session.setActiveToolsByName([]);
+  } else if (Array.isArray(agent.tools) && agent.tools.length > 0) {
     session.setActiveToolsByName(agent.tools);
   }
 
@@ -598,7 +612,7 @@ export default function (pi: ExtensionAPI) {
           `File: ${agent.filePath}`,
           `Description: ${agent.description}`,
           agent.model ? `Model: ${agent.model}` : "",
-          agent.tools ? `Tools: ${agent.tools.join(", ")}` : "",
+          `Tools: ${formatTools(agent.tools)}`,
           agent.systemPrompt ? `\nSystem prompt:\n${agent.systemPrompt}` : "",
         ].filter(Boolean).join("\n");
         ctx.ui.notify(lines, "info");
@@ -984,7 +998,7 @@ export default function (pi: ExtensionAPI) {
           `## ${agent.name} [${agent.source}]`,
           `**Description:** ${agent.description}`,
           agent.model ? `**Model:** ${agent.model}` : null,
-          agent.tools ? `**Tools:** ${agent.tools.join(", ")}` : null,
+          `**Tools:** ${formatTools(agent.tools)}`,
           agent.systemPrompt ? `\n**System prompt:**\n${agent.systemPrompt}` : null,
         ].filter(Boolean).join("\n");
         return { content: [{ type: "text", text: info }] };

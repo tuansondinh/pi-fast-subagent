@@ -8,14 +8,52 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
 
+/**
+ * tools frontmatter semantics:
+ *   unset        → inherit everything (builtins + extensions) — same as `all`
+ *   `all`        → all builtins + all extension tools (web_search, fetch_content, mcp, …)
+ *   `none`       → no tools at all
+ *   comma list   → allowlist; extensions auto-loaded if any listed tool is non-builtin
+ *                  for lean "builtins-only" mode, list them explicitly:
+ *                    tools: read, bash, edit, write, grep, find, ls
+ *
+ * Represented as:
+ *   "all"        → everything (default when frontmatter omits `tools`)
+ *   "none"       → no tools
+ *   string[]     → allowlist
+ */
+export type AgentTools = "all" | "none" | string[];
+
+export const BUILTIN_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+
 export interface AgentConfig {
   name: string;
   description: string;
   model?: string;
-  tools?: string[];
+  tools: AgentTools;
   systemPrompt: string;
   source: "user" | "project";
   filePath: string;
+}
+
+const BUILTIN_TOOLS = new Set<string>(BUILTIN_TOOL_NAMES);
+
+export function agentNeedsExtensions(tools: AgentTools): boolean {
+  if (tools === "all") return true;
+  if (tools === "none") return false;
+  return tools.some((t) => !BUILTIN_TOOLS.has(t));
+}
+
+// Default: everything. Agents list specific tools for lean / restricted mode.
+function parseToolsField(raw: unknown): AgentTools {
+  if (raw === undefined || raw === null) return "all";
+  const str = String(raw).trim();
+  if (!str) return "all";
+  const lower = str.toLowerCase();
+  if (lower === "all") return "all";
+  if (lower === "none") return "none";
+  const list = str.split(",").map((t) => t.trim()).filter(Boolean);
+  return list.length ? list : "all";
 }
 
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
@@ -36,13 +74,12 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
       const content = fs.readFileSync(filePath, "utf-8");
       const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
       if (!frontmatter?.name || !frontmatter?.description) continue;
-      const rawTools = frontmatter.tools;
-      const tools = rawTools?.split(",").map((t: string) => t.trim()).filter(Boolean);
+      const tools = parseToolsField(frontmatter.tools);
       agents.push({
         name: frontmatter.name,
         description: frontmatter.description,
         model: frontmatter.model,
-        tools: tools?.length ? tools : undefined,
+        tools,
         systemPrompt: body.trim(),
         source,
         filePath,

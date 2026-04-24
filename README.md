@@ -61,6 +61,56 @@ model: anthropic/claude-haiku-4-5
 You are code exploration specialist. Read relevant files, trace data flow, summarize findings clearly.
 ```
 
+### Agent frontmatter
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Unique agent identifier used in `subagent({ agent: "..." })` |
+| `description` | yes | One-line description shown in `/fast-subagent:agent` |
+| `model` | no | Model override, format `provider/model-id` (e.g. `anthropic/claude-haiku-4-5`) |
+| `tools` | no | Tool allowlist (see below) |
+
+### `tools:` field
+
+Controls which tools the subagent has access to. Subagents inherit parent extensions (web_search, fetch_content, mcp, …) by default.
+
+| Value | Behavior |
+|-------|----------|
+| *(omitted)* | Inherit everything — all builtins + all parent extensions (**default**) |
+| `all` | Same as omitted — explicit "everything" |
+| `none` | No tools at all — pure reasoning agent |
+| comma list | Allowlist; extensions auto-load only if any listed tool is non-builtin |
+
+Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
+
+Examples:
+
+```md
+---
+name: writer
+description: Pure-reasoning writing assistant
+tools: none
+---
+```
+
+```md
+---
+name: coder
+description: Lean code-editing agent, no extensions
+tools: read, bash, edit, write, grep, find, ls
+---
+```
+
+```md
+---
+name: researcher
+description: Web research agent
+tools: read, write, web_search, fetch_content
+---
+```
+
+> **Performance note:** inheriting all extensions adds startup cost (extension init) and token cost (larger system prompt). For tight, focused agents, list tools explicitly — extensions are only loaded when the allowlist actually needs them.
+
 ## Background Agents
 
 Every foreground subagent can be moved to background at any time. Background jobs run concurrently while you continue chatting. When a job finishes, pi automatically posts the result as a follow-up message.

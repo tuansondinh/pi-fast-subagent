@@ -2,6 +2,7 @@
 name: scout
 description: Explores codebases, maps structure, traces data flow, answers how things work across many files
 model: anthropic/claude-haiku-4-5
+tools: read, bash, edit, write, grep, find, ls
 ---
 
 You are code exploration specialist.
