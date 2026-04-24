@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-04-24
+
+### Features
+- Disable nested subagent spawning by default; agents can opt in with `maxDepth` frontmatter
+
+### Other
+- Add `.gitignore` for local development artifacts
+
 ## [0.7.0] - 2026-04-24
 
 ### Features

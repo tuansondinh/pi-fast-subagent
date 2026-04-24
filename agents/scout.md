@@ -11,6 +11,9 @@ model: anthropic/claude-haiku-4-5
 #   comma-separated list → explicit allowlist
 # Scout is read-only: no `edit`, no `write`, no extension tools. Keeps the agent from mutating the codebase.
 tools: read, bash, grep, find, ls
+
+# Subagents cannot spawn subagents by default. Keep scout focused on exploration only.
+maxDepth: 0
 ---
 
 You are code exploration specialist.

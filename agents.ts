@@ -31,6 +31,8 @@ export interface AgentConfig {
   description: string;
   model?: string;
   tools: AgentTools;
+  /** Number of nested subagent generations this agent may spawn. Default: 0. */
+  maxDepth: number;
   systemPrompt: string;
   source: "user" | "project";
   filePath: string;
@@ -58,6 +60,13 @@ function parseToolsField(raw: unknown): AgentTools {
   return list.length ? list : "all";
 }
 
+function parseMaxDepthField(raw: unknown): number {
+  if (raw === undefined || raw === null || raw === "") return 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
+}
+
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
   if (!fs.existsSync(dir)) return [];
   let entries: fs.Dirent[];
@@ -77,11 +86,15 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
       const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
       if (!frontmatter?.name || !frontmatter?.description) continue;
       const tools = parseToolsField(frontmatter.tools);
+      const maxDepth = parseMaxDepthField(
+        frontmatter.maxDepth ?? frontmatter.max_depth ?? frontmatter.depth ?? frontmatter.subagentDepth,
+      );
       agents.push({
         name: frontmatter.name,
         description: frontmatter.description,
         model: frontmatter.model,
         tools,
+        maxDepth,
         systemPrompt: body.trim(),
         source,
         filePath,

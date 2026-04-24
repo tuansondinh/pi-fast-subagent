@@ -69,6 +69,7 @@ You are code exploration specialist. Read relevant files, trace data flow, summa
 | `description` | yes | One-line description shown in `/fast-subagent:agent` |
 | `model` | no | Model override, format `provider/model-id` (e.g. `anthropic/claude-haiku-4-5`) |
 | `tools` | no | Tool allowlist (see below) |
+| `maxDepth` | no | Nested subagent depth this agent may spawn. Default `0` means this agent cannot call `subagent`. |
 
 ### `tools:` field
 
@@ -124,6 +125,28 @@ tools: all
 > **Performance note:** omitted `tools` / `tools: all` loads every installed pi extension into the subagent session. That adds startup cost (extension init, possibly MCP server spawn, playwright runtime, …) and token cost (bigger system prompt). Use `tools: builtins` or list specific tools for tight, focused agents.
 
 **YAML comments** (`# …`) are allowed inside the frontmatter — handy for documenting *why* a particular tool set was chosen. See `agents/general.md` and `agents/scout.md` for examples.
+
+### `maxDepth:` field
+
+Subagents cannot spawn other subagents by default, even when `tools` exposes the `subagent` tool.
+
+```md
+---
+name: planner
+description: Can delegate one level deeper
+maxDepth: 1
+---
+```
+
+Depth counts nested generations from that agent:
+
+| Value | Behavior |
+|-------|----------|
+| *(omitted)* / `0` | This agent cannot spawn subagents |
+| `1` | This agent may spawn subagents, but those children cannot spawn again unless their own `maxDepth` allows it |
+| `2` | Allows two nested generations, subject to each child agent's own `maxDepth` |
+
+Aliases accepted: `max_depth`, `depth`, `subagentDepth`.
 
 ## Background Agents
 

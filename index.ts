@@ -257,8 +257,9 @@ const _fgJobs = new Map<string, ForegroundDetachEntry>();
 
 // ─── In-process runner ───────────────────────────────────────────────────────
 
-const MAX_DEPTH = 2;
+const DEFAULT_MAX_DEPTH = 0;
 const DEPTH_ENV = "PI_FAST_SUBAGENT_DEPTH";
+const MAX_DEPTH_ENV = "PI_FAST_SUBAGENT_MAX_DEPTH";
 
 interface ToolCallEntry {
   id: string;
@@ -330,8 +331,9 @@ function formatBgJobDetails(job: BackgroundSubagentJob, now = Date.now()): strin
   return lines.join("\n");
 }
 
-// Module-level depth counter — avoids process.env race conditions in parallel mode
+// Module-level depth counters for nested in-process subagent calls.
 let _currentDepth = 0;
+let _currentMaxDepth = DEFAULT_MAX_DEPTH;
 
 async function runAgent(
   agent: AgentConfig,
@@ -343,11 +345,12 @@ async function runAgent(
   parentDepth?: number,
 ): Promise<RunResult> {
   const depth = parentDepth ?? _currentDepth;
-  if (depth >= MAX_DEPTH) {
+  const isNestedCall = depth > 0;
+  if (isNestedCall && depth > _currentMaxDepth) {
     return {
       output: "",
       exitCode: 1,
-      error: `Max subagent depth (${MAX_DEPTH}) exceeded. Increase PI_FAST_SUBAGENT_DEPTH env to allow deeper nesting.`,
+      error: `Nested subagents are disabled by default. Set maxDepth: ${depth} (or higher) in the parent agent frontmatter to allow this call.`,
       toolCalls: [],
       usage: { input: 0, output: 0, cost: 0, turns: 0 },
     };
@@ -543,10 +546,17 @@ async function runAgent(
     });
   });
 
-  // Propagate depth to nested calls — use module counter (safe for parallel) + env for subprocess compat
+  // Propagate depth to nested calls. `maxDepth` is per-agent and defaults to 0,
+  // so subagents cannot spawn subagents unless their frontmatter opts in.
   const prevEnvDepth = process.env[DEPTH_ENV];
-  process.env[DEPTH_ENV] = String(depth + 1);
+  const prevEnvMaxDepth = process.env[MAX_DEPTH_ENV];
+  const prevDepth = _currentDepth;
+  const prevMaxDepth = _currentMaxDepth;
+  const maxDepth = Math.max(DEFAULT_MAX_DEPTH, agent.maxDepth ?? DEFAULT_MAX_DEPTH);
   _currentDepth = depth + 1;
+  _currentMaxDepth = depth + maxDepth;
+  process.env[DEPTH_ENV] = String(_currentDepth);
+  process.env[MAX_DEPTH_ENV] = String(_currentMaxDepth);
 
   let exitCode = 0;
   let error: string | undefined;
@@ -572,7 +582,10 @@ async function runAgent(
     loaderLease.release();
     if (prevEnvDepth === undefined) delete process.env[DEPTH_ENV];
     else process.env[DEPTH_ENV] = prevEnvDepth;
-    _currentDepth = depth;
+    if (prevEnvMaxDepth === undefined) delete process.env[MAX_DEPTH_ENV];
+    else process.env[MAX_DEPTH_ENV] = prevEnvMaxDepth;
+    _currentDepth = prevDepth;
+    _currentMaxDepth = prevMaxDepth;
   }
 
   return { output: lastOutput, exitCode, error, model: detectedModel, toolCalls, usage };
@@ -769,6 +782,7 @@ export default function (pi: ExtensionAPI) {
           `Description: ${agent.description}`,
           agent.model ? `Model: ${agent.model}` : "",
           `Tools: ${formatTools(agent.tools)}`,
+          `Max subagent depth: ${agent.maxDepth}`,
           agent.systemPrompt ? `\nSystem prompt:\n${agent.systemPrompt}` : "",
         ].filter(Boolean).join("\n");
         ctx.ui.notify(lines, "info");
@@ -781,7 +795,7 @@ export default function (pi: ExtensionAPI) {
           "Add .md files to:\n" +
           "  ~/.pi/agent/agents/   (user-level)\n" +
           "  .pi/agents/           (project-level)\n" +
-          "\nFrontmatter required: name, description. Optional: model, tools.",
+          "\nFrontmatter required: name, description. Optional: model, tools, maxDepth.",
           "info"
         );
         return;
@@ -1181,6 +1195,7 @@ export default function (pi: ExtensionAPI) {
           `**Description:** ${agent.description}`,
           agent.model ? `**Model:** ${agent.model}` : null,
           `**Tools:** ${formatTools(agent.tools)}`,
+          `**Max subagent depth:** ${agent.maxDepth}`,
           agent.systemPrompt ? `\n**System prompt:**\n${agent.systemPrompt}` : null,
         ].filter(Boolean).join("\n");
         return { content: [{ type: "text", text: info }] };

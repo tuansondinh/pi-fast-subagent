@@ -11,6 +11,9 @@ model: anthropic/claude-haiku-4-5
 #   comma-separated list → explicit allowlist, e.g. `read, grep, web_search`
 # General is meant to be a do-anything fallback, so it keeps everything explicit.
 tools: all
+
+# Subagents cannot spawn subagents by default. Set maxDepth: 1+ to opt in.
+maxDepth: 0
 ---
 
 You are general-purpose subagent.
