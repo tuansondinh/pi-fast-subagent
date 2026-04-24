@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-04-24
+
+### Features
+- Chronological execution events in expanded subagent view: tool calls and subagent text now interleave in the order they actually ran (press Ctrl+O)
+- Collapsed view shows subagent response followed by only the tool calls that ran after the last text block, rendered as an indented tree (`├─`/`└─`)
+- Agent-name label (e.g. `scout:`) shown before response text in both collapsed and expanded views
+- Configurable preview sizes via `settings.json`: `fastSubagent.previewLines` (response) and `fastSubagent.promptPreviewLines` (prompt), both default 12
+
+### Other
+- Split `index.ts` into focused modules and add a test suite
+- Extract `findTrailingTools()` as a pure helper with 6 unit tests
+- Remove duplicate agent name from the footer status line (now shown as a label)
+- Footer hint simplified to `verbose` for the expand shortcut
+
 ## [0.8.0] - 2026-04-24
 
 ### Features

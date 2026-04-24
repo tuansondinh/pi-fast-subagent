@@ -14,6 +14,24 @@ Runs subagents with `createAgentSession()` in same process instead of spawning `
 - User + project agent discovery
 - Project agents override user agents
 - Max nesting depth guard
+- Chronological expanded view (Ctrl+O): subagent tool calls and response text interleaved in execution order
+- Collapsed view shows response + trailing tool calls as an indented tree
+
+## Settings
+
+Configure preview sizes in `~/.pi/agent/settings.json` or `.pi/settings.json`:
+
+```json
+{
+  "fastSubagent": {
+    "previewLines": 12,
+    "promptPreviewLines": 12
+  }
+}
+```
+
+- `previewLines` — response text preview lines in collapsed view (default 12)
+- `promptPreviewLines` — task/prompt preview lines in collapsed view (default 12)
 
 ## Install
 
