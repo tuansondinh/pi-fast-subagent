@@ -14,6 +14,7 @@ import type {
   AgentToolUpdateCallback,
   ExtensionAPI,
   ExtensionContext,
+  ResourceLoader,
   ToolRenderResultOptions,
 } from "@mariozechner/pi-coding-agent";
 import { BackgroundJobManager } from "./background-job-manager.js";
@@ -36,6 +37,7 @@ import { type AgentConfig, agentNeedsExtensions, discoverAgents } from "./agents
 
 function formatTools(tools: AgentConfig["tools"]): string {
   if (tools === "all") return "all";
+  if (tools === "builtins") return "builtins (default)";
   if (tools === "none") return "none";
   return tools.join(", ");
 }
@@ -125,6 +127,125 @@ function refreshBgStatus(): void {
   _setBgStatus?.(running.length > 0 ? `⧗ ${running.length} bg agent${running.length > 1 ? "s" : ""}` : undefined);
 }
 
+// ─── Resource loader pool ─────────────────────────────────────────────────────
+
+interface LoaderPoolEntry {
+  idle: DefaultResourceLoader[];
+  active: Set<DefaultResourceLoader>;
+  warming: Set<Promise<void>>;
+}
+
+interface LoaderLease {
+  loader: ResourceLoader;
+  release: () => void;
+}
+
+const _loaderPool = new Map<string, LoaderPoolEntry>();
+
+function loaderPoolKey(cwd: string, agentDir: string, noExtensions: boolean): string {
+  return `${cwd}\0${agentDir}\0${noExtensions ? "noext" : "ext"}`;
+}
+
+function getLoaderPoolEntry(cwd: string, agentDir: string, noExtensions: boolean): LoaderPoolEntry {
+  const key = loaderPoolKey(cwd, agentDir, noExtensions);
+  let entry = _loaderPool.get(key);
+  if (!entry) {
+    entry = { idle: [], active: new Set(), warming: new Set() };
+    _loaderPool.set(key, entry);
+  }
+  return entry;
+}
+
+function makeLoaderOptions(cwd: string, agentDir: string, noExtensions: boolean): DefaultResourceLoaderOptions {
+  return {
+    cwd,
+    agentDir,
+    noExtensions,
+    noContextFiles: true,
+    noSkills: true,
+  };
+}
+
+class AgentPromptResourceLoader implements ResourceLoader {
+  constructor(
+    private readonly base: ResourceLoader,
+    private readonly systemPromptOverride: string | undefined,
+  ) {}
+
+  getExtensions() { return this.base.getExtensions(); }
+  getSkills() { return this.base.getSkills(); }
+  getPrompts() { return this.base.getPrompts(); }
+  getThemes() { return this.base.getThemes(); }
+  getAgentsFiles() { return this.base.getAgentsFiles(); }
+  getSystemPrompt() { return this.systemPromptOverride ?? this.base.getSystemPrompt(); }
+  getAppendSystemPrompt() { return this.base.getAppendSystemPrompt(); }
+  extendResources(paths: Parameters<ResourceLoader["extendResources"]>[0]): void { this.base.extendResources(paths); }
+  reload(): Promise<void> { return this.base.reload(); }
+}
+
+function isLoaderWarm(cwd: string, agentDir: string, noExtensions: boolean): boolean {
+  const entry = _loaderPool.get(loaderPoolKey(cwd, agentDir, noExtensions));
+  return !!entry && entry.idle.length > 0;
+}
+
+async function allowUiPaint(coldLoader: boolean): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  if (!coldLoader) return;
+  // Give pi's TUI render timer a real timers-phase turn before CPU-heavy extension loading.
+  await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+async function acquireResourceLoader(
+  cwd: string,
+  agentDir: string,
+  noExtensions: boolean,
+  systemPromptOverride: string | undefined,
+): Promise<LoaderLease> {
+  const entry = getLoaderPoolEntry(cwd, agentDir, noExtensions);
+
+  while (true) {
+    const cached = entry.idle.pop();
+    if (cached) {
+      entry.active.add(cached);
+      let released = false;
+      return {
+        loader: new AgentPromptResourceLoader(cached, systemPromptOverride),
+        release: () => {
+          if (released) return;
+          released = true;
+          entry.active.delete(cached);
+          entry.idle.push(cached);
+        },
+      };
+    }
+
+    const warming = entry.warming.values().next().value as Promise<void> | undefined;
+    if (warming) {
+      await warming;
+      continue;
+    }
+
+    const loader = new DefaultResourceLoader(makeLoaderOptions(cwd, agentDir, noExtensions));
+    const warmPromise = loader.reload()
+      .then(() => { entry.idle.push(loader); })
+      .finally(() => { entry.warming.delete(warmPromise); });
+    entry.warming.add(warmPromise);
+    await warmPromise;
+  }
+}
+
+function warmResourceLoader(cwd: string, agentDir: string, noExtensions: boolean): void {
+  const entry = getLoaderPoolEntry(cwd, agentDir, noExtensions);
+  if (entry.idle.length > 0 || entry.active.size > 0 || entry.warming.size > 0) return;
+  const loader = new DefaultResourceLoader(makeLoaderOptions(cwd, agentDir, noExtensions));
+  const warmPromise = loader.reload()
+    .then(() => { entry.idle.push(loader); })
+    .catch(() => { /* ignore warm failures; foreground call reports real error */ })
+    .finally(() => { entry.warming.delete(warmPromise); });
+  entry.warming.add(warmPromise);
+}
+
 // ─── Foreground detach registry ───────────────────────────────────────────────
 
 interface ForegroundDetachEntry {
@@ -168,6 +289,7 @@ interface AgentRowStatus {
 
 interface SubagentDetails {
   mode?: "single" | "parallel";
+  agentName?: string;
   task?: string;
   // parallel
   parallelAgents?: AgentRowStatus[];
@@ -231,36 +353,59 @@ async function runAgent(
     };
   }
 
+  const bootStartedAt = Date.now();
   const { authStorage, modelRegistry } = getAuth();
   const agentDir = getAgentDir();
+  const noExtensions = !agentNeedsExtensions(agent.tools);
+  const coldLoader = !isLoaderWarm(cwd, agentDir, noExtensions);
 
-  // Build resource loader — no extensions/context files to keep subagent lean.
-  // Agents can opt in to extensions via `extensions: true` in frontmatter, which
-  // makes tools like web_search / fetch_content / mcp / etc. available to the
-  // subagent (subject to the optional `tools:` allowlist below).
-  const loaderOptions: DefaultResourceLoaderOptions = {
-    cwd,
-    agentDir,
-    noExtensions: !agentNeedsExtensions(agent.tools),
-    noContextFiles: true,
-    noSkills: true,
-  };
-  if (agent.systemPrompt) {
-    // Replace pi's base system prompt with the agent's own prompt
-    loaderOptions.systemPromptOverride = () => agent.systemPrompt;
-  }
-
-  const loader = new DefaultResourceLoader(loaderOptions);
-  await loader.reload();
-
-  const { session } = await createAgentSession({
-    cwd,
-    agentDir,
-    sessionManager: SessionManager.inMemory(cwd),
-    authStorage,
-    modelRegistry,
-    resourceLoader: loader,
+  // Fire an immediate "running" emit so the UI draws the agent header + prompt
+  // before the (potentially slow) extension/session load. Without this, pi looks
+  // frozen while `loader.reload()` and `createAgentSession()` are in flight.
+  onUpdate?.({
+    content: [{ type: "text", text: "" }],
+    details: {
+      agentName: agent.name,
+      task,
+      usage: { input: 0, output: 0, cost: 0, turns: 0 },
+      running: true,
+      elapsedMs: 0,
+      model: modelOverride ?? agent.model,
+      toolCalls: [],
+    } satisfies SubagentDetails,
   });
+  // Yield through timers when loader is cold so pi's render loop paints before
+  // CPU-heavy extension loading runs.
+  await allowUiPaint(coldLoader);
+
+  const loaderLease = await acquireResourceLoader(
+    cwd,
+    agentDir,
+    noExtensions,
+    agent.systemPrompt || undefined,
+  );
+
+  let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+  try {
+    const created = await createAgentSession({
+      cwd,
+      agentDir,
+      sessionManager: SessionManager.inMemory(cwd),
+      authStorage,
+      modelRegistry,
+      resourceLoader: loaderLease.loader,
+    });
+    session = created.session;
+  } catch (e) {
+    loaderLease.release();
+    return {
+      output: "",
+      exitCode: 1,
+      error: e instanceof Error ? e.message : String(e),
+      toolCalls: [],
+      usage: { input: 0, output: 0, cost: 0, turns: 0 },
+    };
+  }
 
   // Resolve and apply model
   const modelStr = modelOverride ?? agent.model;
@@ -288,7 +433,7 @@ async function runAgent(
   let lastOutput = "";
   let currentDelta = "";
   let detectedModel: string | undefined;
-  const startedAt = Date.now();
+  const startedAt = bootStartedAt;
   const configuredModel = modelOverride ?? agent.model;
   const toolCalls: ToolCallEntry[] = [];
   const toolStartTimes = new Map<string, number>();
@@ -300,6 +445,7 @@ async function runAgent(
     onUpdate?.({
       content: [{ type: "text", text: currentDelta || lastOutput || "" }],
       details: {
+        agentName: agent.name,
         task,
         usage,
         running: true,
@@ -423,6 +569,7 @@ async function runAgent(
     clearInterval(heartbeat);
     unsubscribe();
     session.dispose();
+    loaderLease.release();
     if (prevEnvDepth === undefined) delete process.env[DEPTH_ENV];
     else process.env[DEPTH_ENV] = prevEnvDepth;
     _currentDepth = depth;
@@ -558,12 +705,21 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     _setBgStatus = (text) => ctx.ui.setStatus(BG_STATUS_KEY, text);
+
+    // Warm one extension-capable loader after startup. First `tools: all` subagent
+    // call can then reuse loaded extensions instead of blocking before first stream.
+    if (process.env.PI_FAST_SUBAGENT_WARM !== "0") {
+      const warmCwd = ctx.cwd;
+      const warmAgentDir = getAgentDir();
+      setTimeout(() => warmResourceLoader(warmCwd, warmAgentDir, false), 1000);
+    }
   });
 
   pi.on("session_shutdown", async () => {
     getBgManager().shutdown();
     _bgManager = null;
     _setBgStatus = null;
+    _loaderPool.clear();
   });
 
   // ─── Ctrl+Shift+B — move foreground subagent to background ─────────────────────────
@@ -866,14 +1022,15 @@ export default function (pi: ExtensionAPI) {
 
       function statusLine(): string {
         if (details.backgroundJobId) return `moved to background · ${details.backgroundJobId}`;
+        const prefix = details.agentName ? `${theme.fg("toolTitle", details.agentName)} · ` : "";
         if (details.running) {
           const parts: string[] = ["running"];
           if (details.usage?.turns) parts.push(`${details.usage.turns} turn${details.usage.turns > 1 ? "s" : ""}`);
           if (details.elapsedMs != null) parts.push(formatDuration(details.elapsedMs));
           if (details.model) parts.push(details.model);
-          return parts.join(" · ");
+          return prefix + parts.join(" · ");
         }
-        return formatUsage(details.usage ?? { input: 0, output: 0, cost: 0, turns: 0 }, details.model);
+        return prefix + formatUsage(details.usage ?? { input: 0, output: 0, cost: 0, turns: 0 }, details.model);
       }
 
       // Name(arg) ✓ 0.3s  or  Name(arg)  (dim, still running)
@@ -904,6 +1061,8 @@ export default function (pi: ExtensionAPI) {
         render(width: number): string[] {
           const out: string[] = [];
           const indent = "  ";
+          const ellipsisLine = (count: number) =>
+            theme.fg("muted", `${indent}… (${count} more line${count === 1 ? "" : "s"})`);
 
           // ── Prompt ────────────────────────────────────────────────────
           if (details.task) {
@@ -913,14 +1072,22 @@ export default function (pi: ExtensionAPI) {
                 for (const w of wrapLine(indent + line, width)) out.push(w);
               }
             } else {
-              // Up to 8 visual lines in collapsed mode
+              // Up to 8 visual lines from the HEAD of the prompt (keep opening, not tail).
               const PROMPT_PREVIEW_LINES = 8;
               if (cache.width !== width || cache.promptLines === undefined) {
-                const preview = truncateToVisualLines(details.task, PROMPT_PREVIEW_LINES, width - indent.length);
-                cache.promptLines = preview.visualLines.map((l) => truncateToWidth(indent + l, width, "..."));
-                cache.promptSkipped = preview.skippedCount;
+                const innerWidth = Math.max(1, width - indent.length);
+                const allVisual: string[] = [];
+                for (const raw of details.task.split("\n")) {
+                  for (const w of wrapLine(raw, innerWidth)) allVisual.push(w);
+                }
+                const head = allVisual.slice(0, PROMPT_PREVIEW_LINES);
+                cache.promptLines = head.map((l) => truncateToWidth(indent + l, width, "..."));
+                cache.promptSkipped = Math.max(0, allVisual.length - head.length);
               }
               out.push(...cache.promptLines);
+              if ((cache.promptSkipped ?? 0) > 0) {
+                out.push(truncateToWidth(ellipsisLine(cache.promptSkipped!), width, "..."));
+              }
             }
           }
 
@@ -949,6 +1116,10 @@ export default function (pi: ExtensionAPI) {
                 cache.responseLines = preview.visualLines.map((l) => truncateToWidth(indent + l, width, "..."));
                 cache.skipped = preview.skippedCount;
                 cache.width = width;
+              }
+              // truncateToVisualLines keeps the tail — show ellipsis BEFORE the visible lines.
+              if ((cache.skipped ?? 0) > 0) {
+                out.push(truncateToWidth(ellipsisLine(cache.skipped!), width, "..."));
               }
               out.push(...(cache.responseLines ?? []));
             }
@@ -1129,6 +1300,7 @@ export default function (pi: ExtensionAPI) {
           return {
             content: [{ type: "text", text: `Moved to background: ${bgJobId}. Completion will be announced automatically.` }],
             details: {
+              agentName: params.agent,
               task: params.task,
               usage: { input: 0, output: 0, cost: 0, turns: 0 },
               running: false,
@@ -1142,6 +1314,7 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: getFinalText(result) }],
           details: {
+            agentName: params.agent,
             task: params.task,
             usage: result.usage,
             running: false,

@@ -2,7 +2,15 @@
 name: scout
 description: Explores codebases, maps structure, traces data flow, answers how things work across many files
 model: anthropic/claude-haiku-4-5
-tools: read, bash, edit, write, grep, find, ls
+
+# tools: which tools this agent can use.
+#   (omit)               → all tools: builtins + every parent extension (default)
+#   all                  → same as omitted — explicit "everything"
+#   builtins             → read, bash, edit, write, grep, find, ls only (fast startup)
+#   none                 → no tools — pure reasoning
+#   comma-separated list → explicit allowlist
+# Scout is read-only: no `edit`, no `write`, no extension tools. Keeps the agent from mutating the codebase.
+tools: read, bash, grep, find, ls
 ---
 
 You are code exploration specialist.

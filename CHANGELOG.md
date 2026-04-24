@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-04-24
+
+### Features
+- Cache and warm extension-capable resource loaders to remove UI freeze before all-tools subagents start streaming
+- Add explicit `tools: builtins` mode for lean agents while preserving omitted `tools` as all-tools default
+
+### Bug Fixes
+- Give pi's TUI a real paint window before cold extension loading so subagent prompt/header appears immediately
+- Preserve per-agent system prompts while reusing warmed loader resources
+
+### Other
+- Document omitted `tools`, `tools: builtins`, `tools: all`, and YAML frontmatter comments in README and bundled agents
+
 ## [0.6.1] - 2026-04-24
 
 ### Bug Fixes

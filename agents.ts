@@ -10,19 +10,19 @@ import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
 
 /**
  * tools frontmatter semantics:
- *   unset        → inherit everything (builtins + extensions) — same as `all`
- *   `all`        → all builtins + all extension tools (web_search, fetch_content, mcp, …)
+ *   unset        → all builtins + all parent extensions — DEFAULT
+ *   `all`        → all builtins + all parent extensions (web_search, fetch_content, mcp, …)
+ *   `builtins`   → built-in coding tools only (read, bash, edit, write, grep, find, ls)
  *   `none`       → no tools at all
  *   comma list   → allowlist; extensions auto-loaded if any listed tool is non-builtin
- *                  for lean "builtins-only" mode, list them explicitly:
- *                    tools: read, bash, edit, write, grep, find, ls
  *
  * Represented as:
- *   "all"        → everything (default when frontmatter omits `tools`)
+ *   "builtins"   → only built-in coding tools
+ *   "all"        → everything (default)
  *   "none"       → no tools
  *   string[]     → allowlist
  */
-export type AgentTools = "all" | "none" | string[];
+export type AgentTools = "builtins" | "all" | "none" | string[];
 
 export const BUILTIN_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 
@@ -40,11 +40,12 @@ const BUILTIN_TOOLS = new Set<string>(BUILTIN_TOOL_NAMES);
 
 export function agentNeedsExtensions(tools: AgentTools): boolean {
   if (tools === "all") return true;
-  if (tools === "none") return false;
+  if (tools === "builtins" || tools === "none") return false;
   return tools.some((t) => !BUILTIN_TOOLS.has(t));
 }
 
-// Default: everything. Agents list specific tools for lean / restricted mode.
+// Default: all tools, matching pi-subagents behavior. Agents opt into lean mode
+// with `tools: builtins` or explicit built-in allowlists.
 function parseToolsField(raw: unknown): AgentTools {
   if (raw === undefined || raw === null) return "all";
   const str = String(raw).trim();
@@ -52,6 +53,7 @@ function parseToolsField(raw: unknown): AgentTools {
   const lower = str.toLowerCase();
   if (lower === "all") return "all";
   if (lower === "none") return "none";
+  if (lower === "builtins" || lower === "builtin") return "builtins";
   const list = str.split(",").map((t) => t.trim()).filter(Boolean);
   return list.length ? list : "all";
 }

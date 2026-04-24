@@ -72,12 +72,13 @@ You are code exploration specialist. Read relevant files, trace data flow, summa
 
 ### `tools:` field
 
-Controls which tools the subagent has access to. Subagents inherit parent extensions (web_search, fetch_content, mcp, …) by default.
+Controls which tools the subagent has access to. The default is **all tools** — builtins plus parent extensions (web_search, fetch_content, mcp, playwright, …). Agents opt into lean mode with `tools: builtins` or an explicit built-in allowlist.
 
 | Value | Behavior |
 |-------|----------|
-| *(omitted)* | Inherit everything — all builtins + all parent extensions (**default**) |
+| *(omitted)* | Builtins + every parent extension (**default**) |
 | `all` | Same as omitted — explicit "everything" |
+| `builtins` | Builtins only — `read, bash, edit, write, grep, find, ls` |
 | `none` | No tools at all — pure reasoning agent |
 | comma list | Allowlist; extensions auto-load only if any listed tool is non-builtin |
 
@@ -95,9 +96,10 @@ tools: none
 
 ```md
 ---
-name: coder
-description: Lean code-editing agent, no extensions
-tools: read, bash, edit, write, grep, find, ls
+name: scout
+description: Read-only code explorer
+# drop `edit` and `write` so the agent cannot mutate the codebase
+tools: read, bash, grep, find, ls
 ---
 ```
 
@@ -105,11 +107,23 @@ tools: read, bash, edit, write, grep, find, ls
 ---
 name: researcher
 description: Web research agent
+# listing `web_search` triggers extension loading; `read` + `write` keep the rest local
 tools: read, write, web_search, fetch_content
 ---
 ```
 
-> **Performance note:** inheriting all extensions adds startup cost (extension init) and token cost (larger system prompt). For tight, focused agents, list tools explicitly — extensions are only loaded when the allowlist actually needs them.
+```md
+---
+name: general
+description: Do-anything helper
+# `tools` omitted means all tools; `tools: all` is equivalent
+tools: all
+---
+```
+
+> **Performance note:** omitted `tools` / `tools: all` loads every installed pi extension into the subagent session. That adds startup cost (extension init, possibly MCP server spawn, playwright runtime, …) and token cost (bigger system prompt). Use `tools: builtins` or list specific tools for tight, focused agents.
+
+**YAML comments** (`# …`) are allowed inside the frontmatter — handy for documenting *why* a particular tool set was chosen. See `agents/general.md` and `agents/scout.md` for examples.
 
 ## Background Agents
 
