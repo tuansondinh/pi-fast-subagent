@@ -495,6 +495,7 @@ export default function (pi: ExtensionAPI) {
             elapsedMs: undefined,
             model: result.model,
             toolCalls: result.toolCalls,
+            executionEvents: result.executionEvents,
           } satisfies SubagentDetails,
           isError: result.exitCode !== 0,
         };

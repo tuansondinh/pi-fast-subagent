@@ -16,7 +16,7 @@ import {
 import { type AgentConfig, agentNeedsExtensions } from "./agents.js";
 import { allowUiPaint, defaultLoaderPool, LoaderPool } from "./loader-pool.js";
 import { summarizeToolArgs } from "./format.js";
-import type { OnUpdate, RunResult, SubagentDetails, ToolCallEntry } from "./types.js";
+import type { ExecutionEvent, OnUpdate, RunResult, SubagentDetails, ToolCallEntry } from "./types.js";
 
 // ─── Auth singletons ─────────────────────────────────────────────────────────
 
@@ -172,6 +172,7 @@ export async function runAgent(
   const configuredModel = modelOverride ?? agent.model;
   const toolCalls: ToolCallEntry[] = [];
   const toolStartTimes = new Map<string, number>();
+  const executionEvents: ExecutionEvent[] = [];
 
   let done = false;
 
@@ -187,6 +188,7 @@ export async function runAgent(
         elapsedMs: Date.now() - startedAt,
         model: detectedModel ?? configuredModel,
         toolCalls: [...toolCalls],
+        executionEvents: [...executionEvents],
       } satisfies SubagentDetails,
     });
   }
@@ -195,12 +197,23 @@ export async function runAgent(
   const heartbeat = setInterval(emitUpdate, 1000);
 
   const unsubscribe = session.subscribe((event: any) => {
+    const now = Date.now();
+
     if (event.type === "tool_execution_start") {
-      toolStartTimes.set(event.toolCallId, Date.now());
+      const startTime = now;
+      toolStartTimes.set(event.toolCallId, startTime);
+      const argSummary = summarizeToolArgs(event.toolName, event.args);
       toolCalls.push({
         id: event.toolCallId,
         name: event.toolName,
-        argSummary: summarizeToolArgs(event.toolName, event.args),
+        argSummary,
+      });
+      executionEvents.push({
+        type: "tool_start",
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        argSummary,
+        timestamp: now,
       });
       emitUpdate();
       return;
@@ -213,6 +226,7 @@ export async function runAgent(
         .filter((p: any) => p.type === "text")
         .map((p: any) => p.text as string)
         .join("\n");
+      const durMs = startedAtTool != null ? now - startedAtTool : undefined;
       let entry: ToolCallEntry | undefined;
       for (let i = toolCalls.length - 1; i >= 0; i--) {
         if (toolCalls[i]!.id === event.toolCallId) { entry = toolCalls[i]; break; }
@@ -225,8 +239,16 @@ export async function runAgent(
       if (entry) {
         entry.result = resultText;
         entry.isError = event.isError;
-        entry.durMs = startedAtTool != null ? Date.now() - startedAtTool : undefined;
+        entry.durMs = durMs;
       }
+      executionEvents.push({
+        type: "tool_end",
+        toolCallId: event.toolCallId,
+        result: resultText,
+        isError: event.isError,
+        durMs: durMs ?? 0,
+        timestamp: now,
+      });
       emitUpdate();
       return;
     }
@@ -235,6 +257,11 @@ export async function runAgent(
       const e = event.assistantMessageEvent;
       if (e?.type === "text_delta" && e.delta) {
         currentDelta += e.delta;
+        executionEvents.push({
+          type: "text_delta",
+          text: e.delta,
+          timestamp: now,
+        });
         emitUpdate();
       }
       return;
@@ -270,6 +297,7 @@ export async function runAgent(
         elapsedMs: Date.now() - startedAt,
         model: detectedModel ?? configuredModel,
         toolCalls: [...toolCalls],
+        executionEvents: [...executionEvents],
       } as unknown as SubagentDetails,
     });
   });
@@ -316,7 +344,7 @@ export async function runAgent(
     _currentMaxDepth = prevMaxDepth;
   }
 
-  return { output: lastOutput, exitCode, error, model: detectedModel, toolCalls, usage };
+  return { output: lastOutput, exitCode, error, model: detectedModel, toolCalls, executionEvents, usage };
 }
 
 // ─── Concurrency helper ─────────────────────────────────────────────────────

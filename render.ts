@@ -130,6 +130,75 @@ export function renderSubagentResult(
     skipped?: number;
   } = {};
 
+  function renderExpandedChronological(width: number): string[] {
+    const out: string[] = [];
+    const indent = "  ";
+    const events = details.executionEvents || [];
+    const toolLineMap = new Map<string, number>(); // toolCallId → line index where tool_start was rendered
+
+    if (details.task) {
+      out.push("Prompt:");
+      for (const line of details.task.split("\n")) {
+        for (const w of wrapLine(indent + line, width)) out.push(w);
+      }
+    }
+
+    if (events.length === 0) {
+      // Fallback: no events, render tool calls then response
+      for (const t of toolCalls) {
+        out.push(truncateToWidth(toolRow(t), width, "..."));
+        if (t.result !== undefined) {
+          for (const line of t.result.split("\n")) {
+            for (const w of wrapLine(theme.fg("dim", indent + line), width)) out.push(w);
+          }
+        }
+      }
+      const responseText = agentText || "";
+      if (responseText) {
+        for (const line of responseText.split("\n")) {
+          for (const w of wrapLine(indent + line, width)) out.push(w);
+        }
+      }
+    } else {
+      // Render events chronologically
+      let lastWasText = false;
+      const agentLabel = `${details.agentName ?? "Agent"}:`;
+      for (const evt of events) {
+        if (evt.type === "tool_start") {
+          lastWasText = false;
+          const call = `${evt.toolName}(${evt.argSummary})`;
+          toolLineMap.set(evt.toolCallId, out.length);
+          out.push(truncateToWidth(call, width, "..."));
+        } else if (evt.type === "text_delta") {
+          if (!lastWasText) {
+            out.push(truncateToWidth(theme.fg("toolTitle", agentLabel), width, "..."));
+            lastWasText = true;
+          }
+          for (const line of evt.text.split("\n")) {
+            for (const w of wrapLine(indent + line, width)) out.push(w);
+          }
+        } else if (evt.type === "tool_end") {
+          lastWasText = false;
+          const toolLineIdx = toolLineMap.get(evt.toolCallId);
+          const dur = evt.durMs != null
+            ? evt.durMs < 1000 ? ` ${evt.durMs}ms` : ` ${(evt.durMs / 1000).toFixed(1)}s`
+            : "";
+          const statusMark = evt.isError ? " ✗" : ` ✓${dur}`;
+          if (toolLineIdx != null) {
+            out[toolLineIdx] = truncateToWidth((out[toolLineIdx] ?? "") + statusMark, width, "...");
+          }
+          if (evt.result) {
+            for (const line of evt.result.split("\n")) {
+              for (const w of wrapLine(theme.fg("dim", indent + line), width)) out.push(w);
+            }
+          }
+        }
+      }
+    }
+
+    return out;
+  }
+
   return {
     invalidate() { cache.width = undefined; },
     render(width: number): string[] {
@@ -138,59 +207,56 @@ export function renderSubagentResult(
       const ellipsisLine = (count: number) =>
         theme.fg("muted", `${indent}… (${count} more line${count === 1 ? "" : "s"})`);
 
+      if (expanded) {
+        // Expanded: render chronologically from events
+        const expandedOut = renderExpandedChronological(width);
+        expandedOut.push("");
+        const status = statusLine();
+        if (status) expandedOut.push(truncateToWidth(status, width, "..."));
+        if (details.running && !details.backgroundJobId) {
+          expandedOut.push(truncateToWidth(theme.fg("dim", "Ctrl+Shift+B: move to background"), width, "..."));
+        }
+        return expandedOut;
+      }
+
+      // Collapsed view
       if (details.task) {
         out.push("Prompt:");
-        if (expanded) {
-          for (const line of details.task.split("\n")) {
-            for (const w of wrapLine(indent + line, width)) out.push(w);
+        const PROMPT_PREVIEW_LINES = 8;
+        if (cache.width !== width || cache.promptLines === undefined) {
+          const innerWidth = Math.max(1, width - indent.length);
+          const allVisual: string[] = [];
+          for (const raw of details.task.split("\n")) {
+            for (const w of wrapLine(raw, innerWidth)) allVisual.push(w);
           }
-        } else {
-          const PROMPT_PREVIEW_LINES = 8;
-          if (cache.width !== width || cache.promptLines === undefined) {
-            const innerWidth = Math.max(1, width - indent.length);
-            const allVisual: string[] = [];
-            for (const raw of details.task.split("\n")) {
-              for (const w of wrapLine(raw, innerWidth)) allVisual.push(w);
-            }
-            const head = allVisual.slice(0, PROMPT_PREVIEW_LINES);
-            cache.promptLines = head.map((l) => truncateToWidth(indent + l, width, "..."));
-            cache.promptSkipped = Math.max(0, allVisual.length - head.length);
-          }
-          out.push(...cache.promptLines);
-          if ((cache.promptSkipped ?? 0) > 0) {
-            out.push(truncateToWidth(ellipsisLine(cache.promptSkipped!), width, "..."));
-          }
+          const head = allVisual.slice(0, PROMPT_PREVIEW_LINES);
+          cache.promptLines = head.map((l) => truncateToWidth(indent + l, width, "..."));
+          cache.promptSkipped = Math.max(0, allVisual.length - head.length);
+        }
+        out.push(...cache.promptLines);
+        if ((cache.promptSkipped ?? 0) > 0) {
+          out.push(truncateToWidth(ellipsisLine(cache.promptSkipped!), width, "..."));
         }
       }
 
       for (const t of toolCalls) {
         out.push(truncateToWidth(toolRow(t), width, "..."));
-        if (expanded && t.result !== undefined) {
-          for (const line of t.result.split("\n")) {
-            for (const w of wrapLine(theme.fg("dim", indent + line), width)) out.push(w);
-          }
-        }
       }
 
       const responseText = agentText || (isPartial ? "" : "");
       if (responseText || isPartial) {
-        out.push("Response:");
-        if (expanded) {
-          for (const line of responseText.split("\n")) {
-            for (const w of wrapLine(indent + line, width)) out.push(w);
-          }
-        } else {
-          const PREVIEW_LINES = 6;
-          if (cache.width !== width) {
-            const preview = truncateToVisualLines(responseText, PREVIEW_LINES, width - indent.length);
-            cache.responseLines = preview.visualLines.map((l) => truncateToWidth(indent + l, width, "..."));
-            cache.skipped = preview.skippedCount;
-            cache.width = width;
-          }
-          if ((cache.skipped ?? 0) > 0) {
-            out.push(truncateToWidth(ellipsisLine(cache.skipped!), width, "..."));
-          }
-          out.push(...(cache.responseLines ?? []));
+        const agentLabel = `${details.agentName ?? "Agent"}:`;
+        out.push(truncateToWidth(theme.fg("toolTitle", agentLabel), width, "..."));
+        const PREVIEW_LINES = 6;
+        if (cache.width !== width) {
+          const preview = truncateToVisualLines(responseText, PREVIEW_LINES, width - indent.length);
+          cache.responseLines = preview.visualLines.map((l) => truncateToWidth(indent + l, width, "..."));
+          cache.skipped = preview.skippedCount;
+          cache.width = width;
+        }
+        out.push(...(cache.responseLines ?? []));
+        if ((cache.skipped ?? 0) > 0) {
+          out.push(truncateToWidth(ellipsisLine(cache.skipped!), width, "..."));
         }
       }
 

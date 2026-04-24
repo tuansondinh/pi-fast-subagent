@@ -11,12 +11,18 @@ export interface ToolCallEntry {
   durMs?: number;
 }
 
+export type ExecutionEvent =
+  | { type: "tool_start"; toolCallId: string; toolName: string; argSummary: string; timestamp: number }
+  | { type: "text_delta"; text: string; timestamp: number }
+  | { type: "tool_end"; toolCallId: string; result: string; isError: boolean; durMs: number; timestamp: number };
+
 export interface RunResult {
   output: string;
   exitCode: number;
   error?: string;
   model?: string;
   toolCalls: ToolCallEntry[];
+  executionEvents?: ExecutionEvent[];
   usage: { input: number; output: number; cost: number; turns: number };
 }
 
@@ -40,6 +46,7 @@ export interface SubagentDetails {
   model?: string;
   backgroundJobId?: string;
   toolCalls: ToolCallEntry[];
+  executionEvents?: ExecutionEvent[];
 }
 
 export type OnUpdate = (partial: {
