@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { getAgentDir, Theme, truncateToVisualLines, keyHint } from "@mariozechner/pi-coding-agent";
 import type { AgentToolResult, ToolRenderResultOptions } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import type { Component } from "@mariozechner/pi-tui";
 
 import { formatDuration, formatUsage } from "./format.js";
 import type { SubagentDetails, ToolCallEntry } from "./types.js";
@@ -71,6 +72,116 @@ function readPreviewSettings(): { previewLines: number; promptPreviewLines: numb
   }
   _settingsCache = { previewLines, promptPreviewLines, readAt: now };
   return _settingsCache;
+}
+
+interface SubagentCallArgs {
+  agent?: unknown;
+  task?: unknown;
+  tasks?: unknown;
+  action?: unknown;
+  background?: unknown;
+}
+
+interface SubagentRenderCallContext {
+  state: Record<string, unknown>;
+  executionStarted: boolean;
+  argsComplete: boolean;
+}
+
+function asString(v: unknown): string | undefined {
+  return typeof v === "string" ? v : undefined;
+}
+
+function taskPreviewLines(task: string, width: number, maxLines: number): { lines: string[]; skipped: number } {
+  const innerWidth = Math.max(1, width - 2);
+  const visual: string[] = [];
+  for (const raw of task.split("\n")) {
+    try {
+      for (const w of wrapTextWithAnsi(raw, innerWidth)) visual.push(w);
+    } catch {
+      visual.push(truncateToWidth(raw, innerWidth, "..."));
+    }
+  }
+  const lines = visual.slice(0, maxLines).map((line) => truncateToWidth(`  ${line}`, width, "..."));
+  return { lines, skipped: Math.max(0, visual.length - lines.length) };
+}
+
+/**
+ * Render tool-call args while provider is still streaming them. This makes long
+ * subagent prompt generation visible before execute() can start.
+ */
+export function renderSubagentCall(
+  args: SubagentCallArgs,
+  theme: Theme,
+  context: SubagentRenderCallContext,
+): Component {
+  const cache = context.state as {
+    callWidth?: number;
+    callLines?: string[];
+    callKey?: string;
+  };
+
+  return {
+    invalidate() {
+      cache.callWidth = undefined;
+      cache.callLines = undefined;
+      cache.callKey = undefined;
+    },
+    render(width: number): string[] {
+      const key = JSON.stringify({ args, executionStarted: context.executionStarted, argsComplete: context.argsComplete, width });
+      if (cache.callWidth === width && cache.callKey === key && cache.callLines) return cache.callLines;
+
+      const out: string[] = [];
+      const agent = asString(args.agent);
+      const action = asString(args.action);
+      const task = asString(args.task);
+      const tasks = Array.isArray(args.tasks) ? args.tasks as Array<Record<string, unknown>> : undefined;
+      const isParallel = !!tasks?.length;
+      const status = context.executionStarted
+        ? "running"
+        : context.argsComplete
+          ? "starting"
+          : task || isParallel
+            ? "writing prompt"
+            : "waiting for prompt";
+      const mode = isParallel ? `Parallel (${tasks!.length})` : "Subagent";
+      const bg = args.background === true ? " · background" : "";
+      const target = agent ? ` ${agent}` : action ? ` ${action}` : "";
+      out.push(truncateToWidth(`${theme.fg("toolTitle", mode)}${target}${bg} · ${theme.fg("dim", status)}`, width, "..."));
+
+      // Once execution starts, result renderer owns prompt display. Keep call row compact.
+      if (context.executionStarted) {
+        cache.callWidth = width;
+        cache.callKey = key;
+        cache.callLines = out;
+        return out;
+      }
+
+      const maxLines = readPreviewSettings().promptPreviewLines;
+      if (task) {
+        out.push(truncateToWidth("Prompt:", width, "..."));
+        const preview = taskPreviewLines(task, width, maxLines);
+        out.push(...preview.lines);
+        if (preview.skipped > 0) out.push(truncateToWidth(theme.fg("muted", `  … (${preview.skipped} more lines)`), width, "..."));
+      } else if (tasks?.length) {
+        const maxRows = Math.max(1, Math.min(maxLines, tasks.length));
+        for (let i = 0; i < maxRows; i++) {
+          const t = tasks[i]!;
+          const rowAgent = asString(t.agent) ?? "?";
+          const rowTask = asString(t.task) ?? "";
+          out.push(truncateToWidth(`  [${rowAgent}] ${rowTask || theme.fg("dim", "writing prompt...")}`, width, "..."));
+        }
+        if (tasks.length > maxRows) out.push(truncateToWidth(theme.fg("muted", `  … (${tasks.length - maxRows} more task${tasks.length - maxRows === 1 ? "" : "s"})`), width, "..."));
+      } else {
+        out.push(truncateToWidth(theme.fg("dim", "  waiting for streamed tool arguments..."), width, "..."));
+      }
+
+      cache.callWidth = width;
+      cache.callKey = key;
+      cache.callLines = out;
+      return out;
+    },
+  };
 }
 
 export function renderSubagentResult(

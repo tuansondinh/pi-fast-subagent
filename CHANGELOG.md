@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] - 2026-04-24
+
+### Bug Fixes
+- Stream subagent prompt/tool-call preview while the parent LLM is still writing delegated task arguments
+- Keep subagent call row compact after execution starts to avoid duplicate prompt rendering
+
 ## [0.9.0] - 2026-04-24
 
 ### Features

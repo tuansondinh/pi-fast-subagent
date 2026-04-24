@@ -26,7 +26,7 @@ import {
   summarizeTask,
 } from "./format.js";
 import { defaultLoaderPool } from "./loader-pool.js";
-import { renderSubagentResult } from "./render.js";
+import { renderSubagentCall, renderSubagentResult } from "./render.js";
 import { getCurrentDepth, mapConcurrent, runAgent } from "./runner.js";
 import { SubagentParams } from "./schemas.js";
 import type { AgentRowStatus, OnUpdate, RunResult, SubagentDetails, ToolCallEntry } from "./types.js";
@@ -316,6 +316,10 @@ export default function (pi: ExtensionAPI) {
       "Use { action: 'list' } to discover available agents.",
     ].join(" "),
     parameters: SubagentParams,
+
+    renderCall(args, theme, context) {
+      return renderSubagentCall(args, theme, context);
+    },
 
     renderResult(result: AgentToolResult<unknown>, opts: ToolRenderResultOptions, theme: Theme) {
       return renderSubagentResult(result, opts, theme);

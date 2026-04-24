@@ -14,6 +14,7 @@ Runs subagents with `createAgentSession()` in same process instead of spawning `
 - User + project agent discovery
 - Project agents override user agents
 - Max nesting depth guard
+- Streamed prompt preview while the parent LLM is writing the subagent task
 - Chronological expanded view (Ctrl+O): subagent tool calls and response text interleaved in execution order
 - Collapsed view shows response + trailing tool calls as an indented tree
 

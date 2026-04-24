@@ -1,6 +1,6 @@
 {
   "name": "pi-fast-subagent",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "In-process subagent delegation for pi with single, parallel, and background modes",
   "type": "module",
   "keywords": [
