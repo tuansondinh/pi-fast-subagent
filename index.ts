@@ -891,7 +891,13 @@ export default function (pi: ExtensionAPI) {
         try { return wrapTextWithAnsi(text, w); } catch { return [truncateToWidth(text, w, "...")]; }
       }
 
-      const cache: { width?: number; responseLines?: string[]; skipped?: number } = {};
+      const cache: {
+        width?: number;
+        promptLines?: string[];
+        promptSkipped?: number;
+        responseLines?: string[];
+        skipped?: number;
+      } = {};
 
       return {
         invalidate() { cache.width = undefined; },
@@ -902,15 +908,19 @@ export default function (pi: ExtensionAPI) {
           // ── Prompt ────────────────────────────────────────────────────
           if (details.task) {
             out.push("Prompt:");
-            const taskLines = details.task.split("\n");
             if (expanded) {
-              for (const line of taskLines) {
+              for (const line of details.task.split("\n")) {
                 for (const w of wrapLine(indent + line, width)) out.push(w);
               }
             } else {
-              // Single truncated line in collapsed
-              const oneLiner = taskLines[0] ?? "";
-              out.push(truncateToWidth(indent + oneLiner, width, "..."));
+              // Up to 8 visual lines in collapsed mode
+              const PROMPT_PREVIEW_LINES = 8;
+              if (cache.width !== width || cache.promptLines === undefined) {
+                const preview = truncateToVisualLines(details.task, PROMPT_PREVIEW_LINES, width - indent.length);
+                cache.promptLines = preview.visualLines.map((l) => truncateToWidth(indent + l, width, "..."));
+                cache.promptSkipped = preview.skippedCount;
+              }
+              out.push(...cache.promptLines);
             }
           }
 
@@ -946,8 +956,9 @@ export default function (pi: ExtensionAPI) {
 
           // ── Status ───────────────────────────────────────────────
           const status = statusLine();
-          const expandHint = !expanded && (cache.skipped ?? 0) > 0
-            ? keyHint("app.tools.expand", `expand · ${cache.skipped} lines hidden`)
+          const totalSkipped = (cache.skipped ?? 0) + (cache.promptSkipped ?? 0);
+          const expandHint = !expanded && totalSkipped > 0
+            ? keyHint("app.tools.expand", `expand · ${totalSkipped} lines hidden`)
             : !expanded && toolCalls.some((t) => t.result !== undefined)
               ? keyHint("app.tools.expand", "expand for tool outputs")
               : "";

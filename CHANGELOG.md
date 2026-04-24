@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-04-24
+
+### Bug Fixes
+- Prompt preview now shows up to 8 visual lines in collapsed view (was cut to a single truncated line). Hidden prompt lines are counted in the `expand` hint alongside response lines.
+
 ## [0.6.0] - 2026-04-24
 
 ### Features
