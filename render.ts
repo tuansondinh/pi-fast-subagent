@@ -2,12 +2,76 @@
  * Render function for the `subagent` tool's result panel.
  */
 
-import { Theme, truncateToVisualLines, keyHint } from "@mariozechner/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { getAgentDir, Theme, truncateToVisualLines, keyHint } from "@mariozechner/pi-coding-agent";
 import type { AgentToolResult, ToolRenderResultOptions } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 
 import { formatDuration, formatUsage } from "./format.js";
 import type { SubagentDetails, ToolCallEntry } from "./types.js";
+
+import type { ExecutionEvent } from "./types.js";
+
+const DEFAULT_PREVIEW_LINES = 12;
+const DEFAULT_PROMPT_PREVIEW_LINES = 12;
+
+/**
+ * From an ordered event log, find tool calls that ran AFTER the last text_delta.
+ * Returns { trailingToolIds, hasAnyText }. When no text has been emitted yet,
+ * hasAnyText is false and callers should show all tool calls instead.
+ */
+export function findTrailingTools(events: ExecutionEvent[]): {
+  trailingToolIds: string[];
+  hasAnyText: boolean;
+} {
+  if (events.length === 0) return { trailingToolIds: [], hasAnyText: false };
+  let lastTextIdx = -1;
+  let hasAnyText = false;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]!.type === "text_delta") { lastTextIdx = i; hasAnyText = true; break; }
+  }
+  const seen = new Set<string>();
+  const trailingToolIds: string[] = [];
+  for (let i = lastTextIdx + 1; i < events.length; i++) {
+    const evt = events[i]!;
+    if (evt.type === "tool_start" && !seen.has(evt.toolCallId)) {
+      seen.add(evt.toolCallId);
+      trailingToolIds.push(evt.toolCallId);
+    }
+  }
+  return { trailingToolIds, hasAnyText };
+}
+
+let _settingsCache: { previewLines: number; promptPreviewLines: number; readAt: number } | null = null;
+const SETTINGS_TTL_MS = 2000;
+
+function readPreviewSettings(): { previewLines: number; promptPreviewLines: number } {
+  const now = Date.now();
+  if (_settingsCache && now - _settingsCache.readAt < SETTINGS_TTL_MS) return _settingsCache;
+  let previewLines = DEFAULT_PREVIEW_LINES;
+  let promptPreviewLines = DEFAULT_PROMPT_PREVIEW_LINES;
+  try {
+    const path = join(getAgentDir(), "settings.json");
+    if (existsSync(path)) {
+      const settings = JSON.parse(readFileSync(path, "utf-8")) as {
+        fastSubagent?: { previewLines?: number; promptPreviewLines?: number };
+      };
+      const fs = settings.fastSubagent;
+      if (fs && typeof fs.previewLines === "number" && fs.previewLines > 0) {
+        previewLines = Math.floor(fs.previewLines);
+      }
+      if (fs && typeof fs.promptPreviewLines === "number" && fs.promptPreviewLines > 0) {
+        promptPreviewLines = Math.floor(fs.promptPreviewLines);
+      }
+    }
+  } catch {
+    // fall through to defaults
+  }
+  _settingsCache = { previewLines, promptPreviewLines, readAt: now };
+  return _settingsCache;
+}
 
 export function renderSubagentResult(
   result: AgentToolResult<unknown>,
@@ -97,15 +161,14 @@ export function renderSubagentResult(
 
   function statusLine(): string {
     if (details.backgroundJobId) return `moved to background · ${details.backgroundJobId}`;
-    const prefix = details.agentName ? `${theme.fg("toolTitle", details.agentName)} · ` : "";
     if (details.running) {
       const parts: string[] = ["running"];
       if (details.usage?.turns) parts.push(`${details.usage.turns} turn${details.usage.turns > 1 ? "s" : ""}`);
       if (details.elapsedMs != null) parts.push(formatDuration(details.elapsedMs));
       if (details.model) parts.push(details.model);
-      return prefix + parts.join(" · ");
+      return parts.join(" · ");
     }
-    return prefix + formatUsage(details.usage ?? { input: 0, output: 0, cost: 0, turns: 0 }, details.model);
+    return formatUsage(details.usage ?? { input: 0, output: 0, cost: 0, turns: 0 }, details.model);
   }
 
   function toolRow(t: ToolCallEntry): string {
@@ -222,7 +285,7 @@ export function renderSubagentResult(
       // Collapsed view
       if (details.task) {
         out.push("Prompt:");
-        const PROMPT_PREVIEW_LINES = 8;
+        const PROMPT_PREVIEW_LINES = readPreviewSettings().promptPreviewLines;
         if (cache.width !== width || cache.promptLines === undefined) {
           const innerWidth = Math.max(1, width - indent.length);
           const allVisual: string[] = [];
@@ -239,15 +302,14 @@ export function renderSubagentResult(
         }
       }
 
-      for (const t of toolCalls) {
-        out.push(truncateToWidth(toolRow(t), width, "..."));
-      }
+      // Find trailing tool calls (those that ran AFTER the last text_delta)
+      const { trailingToolIds, hasAnyText } = findTrailingTools(details.executionEvents || []);
 
       const responseText = agentText || (isPartial ? "" : "");
       if (responseText || isPartial) {
         const agentLabel = `${details.agentName ?? "Agent"}:`;
         out.push(truncateToWidth(theme.fg("toolTitle", agentLabel), width, "..."));
-        const PREVIEW_LINES = 6;
+        const PREVIEW_LINES = readPreviewSettings().previewLines;
         if (cache.width !== width) {
           const preview = truncateToVisualLines(responseText, PREVIEW_LINES, width - indent.length);
           cache.responseLines = preview.visualLines.map((l) => truncateToWidth(indent + l, width, "..."));
@@ -260,13 +322,21 @@ export function renderSubagentResult(
         }
       }
 
+      // Show trailing tool calls (those that ran after the last text block)
+      // If no text yet, show all tools to indicate progress.
+      const toolsToShow = hasAnyText
+        ? toolCalls.filter((t) => trailingToolIds.includes(t.id))
+        : toolCalls;
+      for (let i = 0; i < toolsToShow.length; i++) {
+        const t = toolsToShow[i]!;
+        const isLast = i === toolsToShow.length - 1;
+        const connector = theme.fg("muted", isLast ? "└─ " : "├─ ");
+        out.push(truncateToWidth(indent + connector + toolRow(t), width, "..."));
+      }
+
       const status = statusLine();
       const totalSkipped = (cache.skipped ?? 0) + (cache.promptSkipped ?? 0);
-      const expandHint = !expanded && totalSkipped > 0
-        ? keyHint("app.tools.expand", `expand · ${totalSkipped} lines hidden`)
-        : !expanded && toolCalls.some((t) => t.result !== undefined)
-          ? keyHint("app.tools.expand", "expand for tool outputs")
-          : "";
+      const expandHint = !expanded ? keyHint("app.tools.expand", "verbose") : "";
       const statusWithHint = [status, expandHint].filter(Boolean).join("  ");
       if (statusWithHint) out.push(truncateToWidth(statusWithHint, width, "..."));
       if (details.running && !details.backgroundJobId)
