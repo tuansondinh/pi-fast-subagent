@@ -1,6 +1,6 @@
 # pi-fast-subagent
 
-In-process subagent delegation for [pi](https://github.com/badlogic/pi-mono).
+In-process subagent delegation for [pi](https://github.com/badlogic/pi-mono) with max visibility.
 
 Runs subagents with `createAgentSession()` in same process instead of spawning `pi` subprocesses. This removes subprocess cold-start and reuses pi auth/model registry.
 
