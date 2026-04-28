@@ -272,14 +272,6 @@ Cancel a specific job directly:
 /fast-subagent:bg-cancel sa_ab12cd34
 ```
 
-### `/fast-subagent:debug-model`
-
-Show cached/inferred main-model state used for model inheritance troubleshooting.
-
-```
-/fast-subagent:debug-model
-```
-
 ## Keyboard Shortcuts
 
 | Shortcut | Action |

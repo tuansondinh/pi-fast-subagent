@@ -302,6 +302,16 @@ export function renderSubagentResult(
     promptSkipped?: number;
     responseLines?: string[];
     skipped?: number;
+    expandedWidth?: number;
+    expandedEventsLen?: number;
+    expandedLastEventTs?: number;
+    expandedTask?: string;
+    expandedAgentName?: string;
+    expandedToolCallsLen?: number;
+    expandedAgentTextLen?: number;
+    expandedBodyLines?: string[];
+    expandedFooterKey?: string;
+    expandedOutputLines?: string[];
   } = {};
 
   function renderExpandedChronological(width: number): string[] {
@@ -386,7 +396,19 @@ export function renderSubagentResult(
   }
 
   return {
-    invalidate() { cache.width = undefined; },
+    invalidate() {
+      cache.width = undefined;
+      cache.expandedWidth = undefined;
+      cache.expandedEventsLen = undefined;
+      cache.expandedLastEventTs = undefined;
+      cache.expandedTask = undefined;
+      cache.expandedAgentName = undefined;
+      cache.expandedToolCallsLen = undefined;
+      cache.expandedAgentTextLen = undefined;
+      cache.expandedBodyLines = undefined;
+      cache.expandedFooterKey = undefined;
+      cache.expandedOutputLines = undefined;
+    },
     render(width: number): string[] {
       const out: string[] = [];
       const indent = "  ";
@@ -394,15 +416,52 @@ export function renderSubagentResult(
         theme.fg("muted", `${indent}… (${count} more line${count === 1 ? "" : "s"})`);
 
       if (expanded) {
-        // Expanded: render chronologically from events
-        const expandedOut = renderExpandedChronological(width);
-        expandedOut.push("");
-        const status = statusLine();
-        if (status) expandedOut.push(truncateToWidth(status, width, "..."));
-        if (details.running && !details.backgroundJobId) {
-          expandedOut.push(truncateToWidth(theme.fg("dim", "Ctrl+Shift+B: move to background"), width, "..."));
+        const events = details.executionEvents || [];
+        const lastEventTs = events.length ? events[events.length - 1]!.timestamp : undefined;
+        const taskKey = details.task ?? "";
+        const agentKey = details.agentName ?? "";
+        const bodyCacheHit =
+          cache.expandedWidth === width
+          && cache.expandedEventsLen === events.length
+          && cache.expandedLastEventTs === lastEventTs
+          && cache.expandedTask === taskKey
+          && cache.expandedAgentName === agentKey
+          && cache.expandedToolCallsLen === toolCalls.length
+          && cache.expandedAgentTextLen === agentText.length
+          && Array.isArray(cache.expandedBodyLines);
+
+        let bodyLines: string[];
+        if (bodyCacheHit) {
+          bodyLines = cache.expandedBodyLines!;
+        } else {
+          bodyLines = renderExpandedChronological(width);
+          cache.expandedWidth = width;
+          cache.expandedEventsLen = events.length;
+          cache.expandedLastEventTs = lastEventTs;
+          cache.expandedTask = taskKey;
+          cache.expandedAgentName = agentKey;
+          cache.expandedToolCallsLen = toolCalls.length;
+          cache.expandedAgentTextLen = agentText.length;
+          cache.expandedBodyLines = bodyLines;
+          cache.expandedFooterKey = undefined;
+          cache.expandedOutputLines = undefined;
         }
-        return expandedOut;
+
+        const status = statusLine();
+        const bgHint = details.running && !details.backgroundJobId
+          ? truncateToWidth(theme.fg("dim", "Ctrl+Shift+B: move to background"), width, "...")
+          : "";
+        const footerKey = `${status}__${bgHint}`;
+
+        if (cache.expandedFooterKey !== footerKey || !Array.isArray(cache.expandedOutputLines)) {
+          const expandedOut = [...bodyLines, ""];
+          if (status) expandedOut.push(truncateToWidth(status, width, "..."));
+          if (bgHint) expandedOut.push(bgHint);
+          cache.expandedFooterKey = footerKey;
+          cache.expandedOutputLines = expandedOut;
+        }
+
+        return cache.expandedOutputLines!;
       }
 
       // Collapsed view

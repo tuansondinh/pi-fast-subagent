@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { checkDepthGate, resolveModelObject } from "../runner.ts";
+import { checkDepthGate } from "../runner.ts";
 
 describe("checkDepthGate", () => {
   it("always allows top-level calls (depth 0)", () => {
@@ -26,22 +26,3 @@ describe("checkDepthGate", () => {
   });
 });
 
-describe("resolveModelObject", () => {
-  const sonnet = { provider: "anthropic", id: "claude-sonnet-4-5", name: "Sonnet", api: "anthropic" };
-  const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku", api: "anthropic" };
-  const registry = {
-    getAll: () => [haiku, sonnet],
-    find: (provider: string, id: string) => [haiku, sonnet].find((m) => m.provider === provider && m.id === id),
-  };
-
-  it("returns exact registry match", () => {
-    assert.equal(resolveModelObject(registry as any, "anthropic/claude-sonnet-4-5"), sonnet);
-  });
-
-  it("clones provider model for unknown ad-hoc model id", () => {
-    const model = resolveModelObject(registry as any, "anthropic/claude-sonnet-4-6");
-    assert.equal(model?.provider, "anthropic");
-    assert.equal(model?.id, "claude-sonnet-4-6");
-    assert.equal(model?.api, "anthropic");
-  });
-});

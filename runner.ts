@@ -66,62 +66,6 @@ export function getCurrentDepth(): number {
 
 export interface RunAgentDeps {
   loaderPool?: LoaderPool;
-  modelRegistry?: ModelRegistry;
-  /** Pass a Model object directly to bypass registry lookup (used for model: inherit). */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  modelObject?: any;
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function modelRef(model: any): string {
-  return `${model.provider}/${model.id}`;
-}
-
-/**
- * Resolve provider/modelId into a Model object.
- *
- * `ModelRegistry.find()` only returns bundled/custom registry entries. Pi itself
- * can run ad-hoc provider model IDs (for example via `--model
- * anthropic/claude-sonnet-4-6`) by cloning provider config from a known model.
- * Do same here so `model: inherit` can use main session's exact model ID even
- * before pi's bundled registry knows it.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function resolveModelObject(modelRegistry: ModelRegistry, modelReference: string | undefined): any | undefined {
-  const ref = modelReference?.trim();
-  if (!ref) return undefined;
-
-  const allModels = modelRegistry.getAll();
-  const lowerRef = ref.toLowerCase();
-  const exact = allModels.find((m) => modelRef(m).toLowerCase() === lowerRef || m.id.toLowerCase() === lowerRef);
-  if (exact) return exact;
-
-  const slash = ref.indexOf("/");
-  if (slash === -1) return undefined;
-
-  const providerRef = ref.slice(0, slash).trim();
-  const modelId = ref.slice(slash + 1).trim();
-  if (!providerRef || !modelId) return undefined;
-
-  const providerModels = allModels.filter((m) => m.provider.toLowerCase() === providerRef.toLowerCase());
-  if (providerModels.length === 0) return undefined;
-  const provider = providerModels[0]!.provider;
-
-  const found = modelRegistry.find(provider, modelId);
-  if (found) return found;
-
-  // Unknown model ID for known provider: clone closest provider model so auth,
-  // API, baseUrl, headers, compat, cost shape, and token defaults survive.
-  const idLower = modelId.toLowerCase();
-  const family = ["opus", "sonnet", "haiku", "gpt", "gemini", "kimi", "glm", "grok"].find((token) => idLower.includes(token));
-  const familyModels = family ? providerModels.filter((m) => m.id.toLowerCase().includes(family)) : [];
-  const base = (familyModels[0] ?? providerModels[0])!;
-  return {
-    ...base,
-    provider,
-    id: modelId,
-    name: modelId,
-  };
 }
 
 export async function runAgent(
@@ -148,8 +92,7 @@ export async function runAgent(
   }
 
   const bootStartedAt = Date.now();
-  const { authStorage, modelRegistry: defaultRegistry } = getAuth();
-  const modelRegistry = deps.modelRegistry ?? defaultRegistry;
+  const { authStorage, modelRegistry } = getAuth();
   const agentDir = getAgentDir();
   const noExtensions = !agentNeedsExtensions(agent.tools);
   const coldLoader = !pool.isWarm(cwd, agentDir, noExtensions);
@@ -189,7 +132,6 @@ export async function runAgent(
       authStorage,
       modelRegistry,
       resourceLoader: loaderLease.loader,
-      ...(deps.modelObject ? { model: deps.modelObject } : {}),
     });
     session = created.session;
   } catch (e) {
@@ -207,11 +149,16 @@ export async function runAgent(
   if (createPrevEnvDepth === undefined) delete process.env[DEPTH_ENV];
   else process.env[DEPTH_ENV] = createPrevEnvDepth;
 
-  // Resolve and apply model. Force this even when createAgentSession received
-  // modelObject so restore/default fallback cannot silently win.
-  const modelStr = modelOverride ?? (agent.model === "inherit" ? undefined : agent.model);
-  const model = deps.modelObject ?? resolveModelObject(modelRegistry, modelStr);
-  if (model) await session.setModel(model);
+  // Resolve and apply model
+  const modelStr = modelOverride ?? agent.model;
+  if (modelStr) {
+    const [provider, ...rest] = modelStr.split("/");
+    const modelId = rest.join("/");
+    if (provider && modelId) {
+      const model = modelRegistry.find(provider, modelId);
+      if (model) await session.setModel(model);
+    }
+  }
 
   // Apply tools allowlist.
   //   "all"    → no restriction (everything registered stays active)

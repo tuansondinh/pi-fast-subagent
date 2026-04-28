@@ -27,7 +27,7 @@ import {
 } from "./format.js";
 import { defaultLoaderPool } from "./loader-pool.js";
 import { renderSubagentCall, renderSubagentResult } from "./render.js";
-import { DEPTH_ENV, getCurrentDepth, mapConcurrent, resolveModelObject, runAgent } from "./runner.js";
+import { getCurrentDepth, mapConcurrent, runAgent } from "./runner.js";
 import { SubagentParams } from "./schemas.js";
 import type { AgentRowStatus, OnUpdate, RunResult, SubagentDetails, ToolCallEntry } from "./types.js";
 
@@ -36,9 +36,6 @@ import type { AgentRowStatus, OnUpdate, RunResult, SubagentDetails, ToolCallEntr
 let _bgManager: BackgroundJobManager | null = null;
 let _onBgJobComplete: ((job: BackgroundSubagentJob) => void) | null = null;
 let _setBgStatus: ((text: string | undefined) => void) | null = null;
-let _currentMainModel: string | undefined;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _currentMainModelObject: any | undefined;
 
 function getBgManager(): BackgroundJobManager {
   if (!_bgManager) _bgManager = new BackgroundJobManager({
@@ -52,53 +49,6 @@ function refreshBgStatus(): void {
   _setBgStatus?.(running.length > 0 ? `⧗ ${running.length} bg agent${running.length > 1 ? "s" : ""}` : undefined);
 }
 
-function rememberMainModel(model: ExtensionContext["model"]): void {
-  if (!model) return;
-  _currentMainModel = `${model.provider}/${model.id}`;
-  _currentMainModelObject = model;
-}
-
-function rememberMainModelReference(modelRef: string | undefined, ctx: ExtensionContext): void {
-  if (!modelRef) return;
-  _currentMainModel = modelRef;
-  _currentMainModelObject = resolveModelObject(ctx.modelRegistry, modelRef) ?? _currentMainModelObject;
-}
-
-function rememberPayloadModel(payload: unknown, ctx: ExtensionContext): void {
-  const modelId = typeof payload === "object" && payload && "model" in payload && typeof (payload as { model?: unknown }).model === "string"
-    ? (payload as { model: string }).model
-    : undefined;
-  if (!modelId) return;
-
-  const lower = modelId.toLowerCase();
-  const matches = ctx.modelRegistry.getAll().filter((m) => m.id.toLowerCase() === lower || `${m.provider}/${m.id}`.toLowerCase() === lower);
-  if (matches.length === 1) rememberMainModel(matches[0]);
-}
-
-function isMainSessionEvent(): boolean {
-  return !process.env[DEPTH_ENV];
-}
-
-function rememberLatestSessionModel(ctx: ExtensionContext): void {
-  const scan = (entries: ReturnType<ExtensionContext["sessionManager"]["getEntries"]>): boolean => {
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const e = entries[i]!;
-      if (e.type === "model_change") {
-        rememberMainModelReference(`${(e as any).provider}/${(e as any).modelId}`, ctx);
-        return true;
-      }
-    }
-    return false;
-  };
-  if (!scan(ctx.sessionManager.getEntries())) scan(ctx.sessionManager.getBranch());
-}
-
-function getInheritedMainModel(ctx: ExtensionContext): { modelRef?: string; deps: { modelRegistry: ExtensionContext["modelRegistry"]; modelObject?: unknown } } {
-  rememberMainModel(ctx.model);
-  if (!_currentMainModelObject && _currentMainModel) rememberMainModelReference(_currentMainModel, ctx);
-  if (_currentMainModelObject) return { modelRef: _currentMainModel, deps: { modelRegistry: ctx.modelRegistry, modelObject: _currentMainModelObject } };
-  return { modelRef: _currentMainModel, deps: { modelRegistry: ctx.modelRegistry } };
-}
 
 // ─── Foreground detach registry ─────────────────────────────────────────────
 
@@ -135,28 +85,8 @@ export default function (pi: ExtensionAPI) {
     );
   };
 
-  pi.on("model_select", async (event) => {
-    if (!isMainSessionEvent()) return;
-    rememberMainModel(event.model);
-  });
-
-  pi.on("before_provider_request", async (event, ctx) => {
-    if (!isMainSessionEvent()) return;
-    if (ctx.model) rememberMainModel(ctx.model);
-    else rememberPayloadModel(event.payload, ctx);
-  });
-
-  pi.on("turn_start", async (_event, ctx) => {
-    if (!isMainSessionEvent()) return;
-    rememberMainModel(ctx.model);
-  });
-
   pi.on("session_start", async (_event, ctx) => {
     _setBgStatus = (text) => ctx.ui.setStatus(BG_STATUS_KEY, text);
-    if (!isMainSessionEvent()) return;
-    // Seed _currentMainModel from ctx.model or session entries.
-    if (ctx.model) rememberMainModel(ctx.model);
-    else rememberLatestSessionModel(ctx);
 
     // Warm one extension-capable loader after startup so first `tools: all`
     // subagent call reuses loaded extensions instead of blocking.
@@ -171,8 +101,6 @@ export default function (pi: ExtensionAPI) {
     getBgManager().shutdown();
     _bgManager = null;
     _setBgStatus = null;
-    _currentMainModel = undefined;
-    _currentMainModelObject = undefined;
     defaultLoaderPool.clear();
   });
 
@@ -194,30 +122,6 @@ export default function (pi: ExtensionAPI) {
       } catch (e) {
         ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
       }
-    },
-  });
-
-  // ─── /fast-subagent:debug-model ──────────────────────────────────────────
-  pi.registerCommand("fast-subagent:debug-model", {
-    description: "Debug: show cached main model and session entries.",
-    async handler(_args, ctx) {
-      const entries = ctx.sessionManager.getEntries();
-      const modelEntries = entries.filter((e) => e.type === "model_change");
-      const branch = ctx.sessionManager.getBranch();
-      const branchModelEntries = branch.filter((e) => e.type === "model_change");
-      if (!_currentMainModelObject && _currentMainModel) rememberMainModelReference(_currentMainModel, ctx);
-      const registryMatch = resolveModelObject(ctx.modelRegistry, _currentMainModel);
-      const lines = [
-        `_currentMainModel: ${_currentMainModel ?? "(undefined)"}`,
-        `_currentMainModelObject: ${_currentMainModelObject ? `${_currentMainModelObject.provider}/${_currentMainModelObject.id}` : "(undefined)"}`,
-        `ctx.model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(undefined)"}`,
-        `resolveModelObject(_currentMainModel): ${registryMatch ? `${registryMatch.provider}/${registryMatch.id}` : "(undefined)"}`,
-        `getEntries() total: ${entries.length}`,
-        `getEntries() model_change: ${modelEntries.map((e) => `${(e as any).provider}/${(e as any).modelId}`).join(", ") || "none"}`,
-        `getBranch() total: ${branch.length}`,
-        `getBranch() model_change: ${branchModelEntries.map((e) => `${(e as any).provider}/${(e as any).modelId}`).join(", ") || "none"}`,
-      ];
-      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 
@@ -514,26 +418,13 @@ export default function (pi: ExtensionAPI) {
         const { agent, error } = findAgent(params.agent);
         if (error || !agent) return { content: [{ type: "text", text: error ?? "Not found" }] };
 
-        // Determine if this agent should inherit the main session's model.
-        const shouldInherit = !params.model && (!agent.model || agent.model === "inherit");
-        let inheritedModel: string | undefined;
-        let inheritDeps: { modelRegistry: ExtensionContext["modelRegistry"]; modelObject?: unknown } = { modelRegistry: ctx.modelRegistry };
-        if (shouldInherit) {
-          let inherited = getInheritedMainModel(ctx);
-          if (!inherited.modelRef) {
-            rememberLatestSessionModel(ctx);
-            inherited = getInheritedMainModel(ctx);
-          }
-          inheritedModel = inherited.modelRef;
-          inheritDeps = inherited.deps;
-        }
-        const effectiveModel = params.model ?? (shouldInherit ? inheritedModel : (agent.model === "inherit" ? undefined : agent.model));
+        const effectiveModel = params.model;
 
         if (params.background) {
           const bgAbort = new AbortController();
           const handle: BackgroundHandleLike = { abort: () => bgAbort.abort() };
           const resultPromise: Promise<BackgroundJobResult> = runAgent(
-            agent, params.task, cwd, effectiveModel, bgAbort.signal, undefined, undefined, inheritDeps,
+            agent, params.task, cwd, effectiveModel, bgAbort.signal, undefined,
           ).then((r) => ({ summary: r.output, exitCode: r.exitCode, error: r.error, model: r.model }));
           const jobId = getBgManager().adoptHandle(agent.name, params.task, cwd, handle, resultPromise);
           return { content: [{ type: "text", text: `Background job started: ${jobId}\nTo check status, ask me to poll job ${jobId}.` }] };
@@ -553,7 +444,7 @@ export default function (pi: ExtensionAPI) {
           : undefined;
 
         const agentRunPromise: Promise<RunResult> = runAgent(
-          agent, params.task, cwd, effectiveModel, agentAbort.signal, wrappedOnUpdate, undefined, inheritDeps,
+          agent, params.task, cwd, effectiveModel, agentAbort.signal, wrappedOnUpdate,
         );
 
         const bgResultPromise: Promise<BackgroundJobResult> = agentRunPromise
@@ -658,17 +549,14 @@ export default function (pi: ExtensionAPI) {
             parallelAgents[i]!.responseText = (partial.content?.[0] as any)?.text || parallelAgents[i]!.responseText;
             emitParallel(true);
           };
-          const shouldInherit = !t.model && (!agent.model || agent.model === "inherit");
-          const inherited = shouldInherit ? getInheritedMainModel(ctx) : undefined;
           const result = await runAgent(
             agent,
             t.task,
             t.cwd ?? cwd,
-            t.model ?? inherited?.modelRef,
+            t.model,
             signal,
             agentOnUpdate,
             parentDepth,
-            inherited?.deps ?? { modelRegistry: ctx.modelRegistry },
           );
           parallelAgents[i]!.status = result.exitCode === 0 ? "done" : "error";
           parallelAgents[i]!.durMs = Date.now() - agentStart;
