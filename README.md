@@ -272,6 +272,14 @@ Cancel a specific job directly:
 /fast-subagent:bg-cancel sa_ab12cd34
 ```
 
+### `/fast-subagent:debug-model`
+
+Show cached/inferred main-model state used for model inheritance troubleshooting.
+
+```
+/fast-subagent:debug-model
+```
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
@@ -289,7 +297,7 @@ Goal: keep this extension **small and focused** — aligned with pi's philosophy
 
 - Async/background isolation not supported in-process
 - Git worktree isolation not supported
-- Nested subagent depth limited to 2 by default
+- Nested subagent spawning disabled by default (`maxDepth: 0`); opt in per agent via frontmatter
 
 ## Tool Reference
 

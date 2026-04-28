@@ -334,11 +334,22 @@ export function renderSubagentResult(
         }
       }
     } else {
-      // Render events chronologically
+      // Render events chronologically. Coalesce text deltas to avoid one-line-per-token output.
       let lastWasText = false;
+      let textBuffer = "";
       const agentLabel = `${details.agentName ?? "Agent"}:`;
+
+      const flushTextBuffer = () => {
+        if (!textBuffer) return;
+        for (const line of textBuffer.split("\n")) {
+          for (const w of wrapLine(indent + line, width)) out.push(w);
+        }
+        textBuffer = "";
+      };
+
       for (const evt of events) {
         if (evt.type === "tool_start") {
+          if (lastWasText) flushTextBuffer();
           lastWasText = false;
           const call = `${evt.toolName}(${evt.argSummary})`;
           toolLineMap.set(evt.toolCallId, out.length);
@@ -348,10 +359,9 @@ export function renderSubagentResult(
             out.push(truncateToWidth(theme.fg("toolTitle", agentLabel), width, "..."));
             lastWasText = true;
           }
-          for (const line of evt.text.split("\n")) {
-            for (const w of wrapLine(indent + line, width)) out.push(w);
-          }
+          textBuffer += evt.text;
         } else if (evt.type === "tool_end") {
+          if (lastWasText) flushTextBuffer();
           lastWasText = false;
           const toolLineIdx = toolLineMap.get(evt.toolCallId);
           const dur = evt.durMs != null
@@ -368,6 +378,8 @@ export function renderSubagentResult(
           }
         }
       }
+
+      if (lastWasText) flushTextBuffer();
     }
 
     return out;

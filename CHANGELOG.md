@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.2] - 2026-04-28
+
+### Features
+- Inherit main-session model more reliably for subagents (single/parallel/background), including ad-hoc provider model IDs not yet present in registry
+- Add `/fast-subagent:debug-model` command to inspect cached/inferred main model state
+
+### Bug Fixes
+- Fix expanded verbose output formatting by coalescing streamed `text_delta` chunks before wrapping (prevents one-token-per-line rendering)
+
+### Other
+- Add unit tests for `resolveModelObject()` fallback behavior
+- Update bundled `scout` agent default model to `openai-codex/gpt-5.4-mini`
+
 ## [0.9.1] - 2026-04-24
 
 ### Bug Fixes
