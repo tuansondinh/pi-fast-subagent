@@ -5,6 +5,8 @@
  * via `onUpdate`, and enforces the per-agent `maxDepth` gate on nested calls.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import {
   AuthStorage,
   createAgentSession,
@@ -32,8 +34,6 @@ export function getAuth() {
 // ─── Depth gating ────────────────────────────────────────────────────────────
 
 export const DEFAULT_MAX_DEPTH = 0;
-export const DEPTH_ENV = "PI_FAST_SUBAGENT_DEPTH";
-export const MAX_DEPTH_ENV = "PI_FAST_SUBAGENT_MAX_DEPTH";
 
 /**
  * Pure helper: given the current nesting depth and the allowed max depth,
@@ -53,13 +53,22 @@ export function checkDepthGate(depth: number, maxDepth: number): { allowed: bool
   return { allowed: true };
 }
 
-// Module-level depth counters for nested in-process subagent calls.
-let _currentDepth = 0;
-let _currentMaxDepth = DEFAULT_MAX_DEPTH;
+export interface DepthState {
+  depth: number;
+  maxDepth: number;
+}
 
-/** Read-only accessors for the current in-flight depth (used by parallel mode). */
-export function getCurrentDepth(): number {
-  return _currentDepth;
+const TOP_LEVEL_DEPTH: DepthState = { depth: 0, maxDepth: DEFAULT_MAX_DEPTH };
+const _depthContext = new AsyncLocalStorage<DepthState>();
+
+/** Read the depth/maxDepth in the current async context, or top-level defaults if none. */
+export function getDepthState(): DepthState {
+  return _depthContext.getStore() ?? TOP_LEVEL_DEPTH;
+}
+
+/** Run `fn` with `state` set as the current async-scoped depth context. */
+export function runWithDepth<T>(state: DepthState, fn: () => Promise<T>): Promise<T> {
+  return _depthContext.run(state, fn);
 }
 
 // ─── runAgent ────────────────────────────────────────────────────────────────
@@ -75,12 +84,11 @@ export async function runAgent(
   modelOverride: string | undefined,
   signal: AbortSignal | undefined,
   onUpdate: OnUpdate | undefined,
-  parentDepth?: number,
   deps: RunAgentDeps = {},
 ): Promise<RunResult> {
   const pool = deps.loaderPool ?? defaultLoaderPool;
-  const depth = parentDepth ?? _currentDepth;
-  const gate = checkDepthGate(depth, _currentMaxDepth);
+  const { depth, maxDepth } = getDepthState();
+  const gate = checkDepthGate(depth, maxDepth);
   if (!gate.allowed) {
     return {
       output: "",
@@ -114,8 +122,6 @@ export async function runAgent(
   });
   await allowUiPaint(coldLoader);
 
-  const createPrevEnvDepth = process.env[DEPTH_ENV];
-  process.env[DEPTH_ENV] = String(depth + 1);
   const loaderLease = await pool.acquire(
     cwd,
     agentDir,
@@ -136,8 +142,6 @@ export async function runAgent(
     session = created.session;
   } catch (e) {
     loaderLease.release();
-    if (createPrevEnvDepth === undefined) delete process.env[DEPTH_ENV];
-    else process.env[DEPTH_ENV] = createPrevEnvDepth;
     return {
       output: "",
       exitCode: 1,
@@ -146,8 +150,6 @@ export async function runAgent(
       usage: { input: 0, output: 0, cost: 0, turns: 0 },
     };
   }
-  if (createPrevEnvDepth === undefined) delete process.env[DEPTH_ENV];
-  else process.env[DEPTH_ENV] = createPrevEnvDepth;
 
   // Resolve and apply model
   const modelStr = modelOverride ?? agent.model;
@@ -308,17 +310,11 @@ export async function runAgent(
     });
   });
 
-  // Propagate depth to nested calls. `maxDepth` is per-agent and defaults to 0,
-  // so subagents cannot spawn subagents unless their frontmatter opts in.
-  const prevEnvDepth = process.env[DEPTH_ENV];
-  const prevEnvMaxDepth = process.env[MAX_DEPTH_ENV];
-  const prevDepth = _currentDepth;
-  const prevMaxDepth = _currentMaxDepth;
-  const maxDepth = Math.max(DEFAULT_MAX_DEPTH, agent.maxDepth ?? DEFAULT_MAX_DEPTH);
-  _currentDepth = depth + 1;
-  _currentMaxDepth = depth + maxDepth;
-  process.env[DEPTH_ENV] = String(_currentDepth);
-  process.env[MAX_DEPTH_ENV] = String(_currentMaxDepth);
+  // Per-agent maxDepth; defaults to 0 so subagents can't spawn subagents unless
+  // their frontmatter opts in. AsyncLocalStorage scopes this to the nested
+  // call, so overlapping parallel agents don't trample each other's state.
+  const agentMaxDepth = Math.max(DEFAULT_MAX_DEPTH, agent.maxDepth ?? DEFAULT_MAX_DEPTH);
+  const childState: DepthState = { depth: depth + 1, maxDepth: depth + agentMaxDepth };
 
   let exitCode = 0;
   let error: string | undefined;
@@ -329,7 +325,7 @@ export async function runAgent(
     const onAbort = () => void session.abort();
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      await session.prompt(task);
+      await runWithDepth(childState, () => session.prompt(task));
     } finally {
       signal?.removeEventListener("abort", onAbort);
     }
@@ -342,12 +338,6 @@ export async function runAgent(
     unsubscribe();
     session.dispose();
     loaderLease.release();
-    if (prevEnvDepth === undefined) delete process.env[DEPTH_ENV];
-    else process.env[DEPTH_ENV] = prevEnvDepth;
-    if (prevEnvMaxDepth === undefined) delete process.env[MAX_DEPTH_ENV];
-    else process.env[MAX_DEPTH_ENV] = prevEnvMaxDepth;
-    _currentDepth = prevDepth;
-    _currentMaxDepth = prevMaxDepth;
   }
 
   return { output: lastOutput, exitCode, error, model: detectedModel, toolCalls, executionEvents, usage };

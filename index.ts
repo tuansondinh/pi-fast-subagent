@@ -27,7 +27,7 @@ import {
 } from "./format.js";
 import { defaultLoaderPool } from "./loader-pool.js";
 import { renderSubagentCall, renderSubagentResult } from "./render.js";
-import { getCurrentDepth, mapConcurrent, runAgent } from "./runner.js";
+import { mapConcurrent, runAgent } from "./runner.js";
 import { SubagentParams } from "./schemas.js";
 import type { AgentRowStatus, OnUpdate, RunResult, SubagentDetails, ToolCallEntry } from "./types.js";
 
@@ -532,7 +532,6 @@ export default function (pi: ExtensionAPI) {
 
         emitParallel(true);
 
-        const parentDepth = getCurrentDepth();
         const allResults = await mapConcurrent(expanded, concurrency, async (t, i) => {
           parallelAgents[i]!.status = "running";
           emitParallel(true);
@@ -556,7 +555,6 @@ export default function (pi: ExtensionAPI) {
             t.model,
             signal,
             agentOnUpdate,
-            parentDepth,
           );
           parallelAgents[i]!.status = result.exitCode === 0 ? "done" : "error";
           parallelAgents[i]!.durMs = Date.now() - agentStart;
