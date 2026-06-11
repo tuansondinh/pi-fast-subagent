@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.4] - 2026-06-11
+
+### Bug Fixes
+- Replace module-level depth counters with AsyncLocalStorage
+
 ## [0.9.3] - 2026-04-28
 
 ### Bug Fixes
